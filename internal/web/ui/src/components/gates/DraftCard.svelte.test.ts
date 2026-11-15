@@ -106,6 +106,21 @@ describe("draftcard_test.go", () => {
     expect(c.querySelector('.pv[data-value="REQUEST_CHANGES"]')!.getAttribute("title")).toBe("REQUEST_CHANGES");
   });
 
+  test("a nested or Markdown field takes the card's whole width, a list item heads its fields", () => {
+    const d = reviewDraft();
+    Object.assign(d.fields[1].fields[0].fields[3], { markdown: true });
+    const c = draft(d);
+    const row = (pointer: string) => {
+      const dd = c.querySelector(`dd[data-pointer="${pointer}"]`)!;
+      return { dt: dd.previousElementSibling!.className, dd: dd.className };
+    };
+    expect(row("/event")).toEqual({ dt: "", dd: "" });
+    expect(row("/comments")).toEqual({ dt: "wide", dd: "wide" });
+    expect(row("/comments/0")).toEqual({ dt: "wide", dd: "wide" });
+    expect(row("/comments/0/path")).toEqual({ dt: "", dd: "" });
+    expect(row("/comments/0/body")).toEqual({ dt: "wide", dd: "wide" });
+  });
+
   test("TestCardEditableFromSchema", async () => {
     const posts = recordPosts();
     const c = draft(reviewDraft());

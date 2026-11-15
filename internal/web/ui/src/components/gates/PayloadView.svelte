@@ -8,13 +8,14 @@
   // its raw one in its title. While the draft is edited under key, each editable field with options is a select.
   let { draft, fields, key, editing = false, scope }: { draft: J; fields: J[]; key: string; editing?: boolean; scope: string } = $props();
   const edits = $derived(editing ? fieldEdits(draft, key) : {});
+  const wide = (f: J) => (f.fields || []).length > 0 || !!f.markdown;
 </script>
 
 {#if fields.length}
   <dl class="d-payload">
     {#each fields as f (f.pointer)}
-      <dt>{f.label}</dt>
-      <dd data-pointer={f.pointer}>
+      <dt class={[wide(f) && "wide"]}>{f.label}</dt>
+      <dd class={[wide(f) && "wide"]} data-pointer={f.pointer}>
         {#if (f.fields || []).length}
           <PayloadView {draft} fields={f.fields} {key} {editing} {scope} />
         {:else if editing && f.editable && (f.options || []).length}

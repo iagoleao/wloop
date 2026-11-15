@@ -125,9 +125,9 @@ export function reviewDraft(): J {
       { pointer: "/event", label: "Verdict", value: "REQUEST_CHANGES", shown: "Request changes", editable: true,
         options: [{ value: "APPROVE", label: "Approve" }, { value: "REQUEST_CHANGES", label: "Request changes" }, { value: "COMMENT", label: "Comment" }] },
       { pointer: "/comments", label: "Inline comments", fields: [
-        { pointer: "/comments/1", label: "1", fields: [leaf("/comments/0/path", "File", "api/handler.go"), leaf("/comments/0/line", "Line", "42"),
+        { pointer: "/comments/0", label: "1", fields: [leaf("/comments/0/path", "File", "api/handler.go"), leaf("/comments/0/line", "Line", "42"),
           leaf("/comments/0/side", "Side", "RIGHT"), leaf("/comments/0/body", "Comment", "Return the error.")] },
-        { pointer: "/comments/2", label: "2", fields: [leaf("/comments/1/path", "File", "api/retry.go"), leaf("/comments/1/start_line", "start_line", "50"),
+        { pointer: "/comments/1", label: "2", fields: [leaf("/comments/1/path", "File", "api/retry.go"), leaf("/comments/1/start_line", "start_line", "50"),
           leaf("/comments/1/line", "Line", "58"), leaf("/comments/1/body", "Comment", "Back off\nbetween tries.")] },
       ] },
     ],

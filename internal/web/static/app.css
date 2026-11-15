@@ -795,6 +795,9 @@ textarea.draft-text { box-sizing: border-box; width: 100%; padding: var(--space-
 .d-payload { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-4) var(--space-12); margin: var(--space-6) 0; font-size: var(--text-meta); }
 .d-payload dt { color: var(--muted); }
 .d-payload dd { margin: 0; min-width: 0; }
+.d-payload > .wide { grid-column: 1 / -1; }
+.d-payload > dt.wide { margin-top: var(--space-4); font-weight: 600; }
+.d-payload > dt.wide + dd.wide { margin-top: calc(-1 * var(--space-2)); }
 .d-payload dd > .d-payload { margin: 0; padding-left: var(--space-8); border-left: 1px solid var(--rule); }
 .d-payload .pv { white-space: pre-wrap; }
 .d-payload .pv.md { white-space: normal; }
