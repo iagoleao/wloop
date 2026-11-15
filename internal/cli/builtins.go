@@ -18,7 +18,6 @@ import (
 	"github.com/wloophq/wloop/internal/config"
 	"github.com/wloophq/wloop/internal/core/turns"
 	dintent "github.com/wloophq/wloop/internal/domain/intent"
-	dinv "github.com/wloophq/wloop/internal/domain/inventory"
 	"github.com/wloophq/wloop/internal/domain/round"
 	"github.com/wloophq/wloop/internal/domain/unit"
 	"github.com/wloophq/wloop/internal/intent/builtin"
@@ -42,99 +41,11 @@ const beforeTakeOver = "take_over"
 // request.
 const contextPR = builtin.ContextPR
 
-// route is a way a round of an intent goes out from the command line.
-type route int
-
-const (
-	// routeSession is a round asked for from an agent session (byHand).
-	routeSession route = iota
-	// routeAsked is a round asked for through the daemon's action (askedRound).
-	routeAsked
-	// routeLaunch is a resume or a launch the turn service asks for.
-	routeLaunch
-)
-
-// wire is rt as an effect request names it.
-func (rt route) wire() string {
-	switch rt {
-	case routeAsked:
-		return src.RouteAsked
-	case routeLaunch:
-		return src.RouteLaunch
-	}
-	return src.RouteSession
-}
-
-// sentRound is what a turn effect reads of a round on its way out; the
-// route fills it as the round goes.
-type sentRound struct {
-	env       *Env
-	ctx       context.Context
-	ref       pr.Ref
-	pr        *pr.PullRequest
-	cfg       config.Config
-	inputs    map[string]any
-	id        string
-	submitted bool
-	guidance  string
-}
-
-// effectRun is what a host effect does on a route, by phase: guide before
-// the round, sent once it went out, unsent when it did not.
-type effectRun struct {
-	guide, sent, unsent func(r *sentRound)
-}
-
-// onSentEffect is a turn effect the host applies and what it does on each
-// route; every other turn effect is its plugin's, applied through
-// ApplyEffect once the round went out.
-type onSentEffect struct {
-	name string
-	on   map[route]effectRun
-}
-
-var keepsGuidance = effectRun{
-	guide:  func(r *sentRound) { r.guidance = r.env.handGuidance(r.ctx, r.ref, r.guidance) },
-	unsent: func(r *sentRound) { r.env.keepGuidance(r.ctx, r.ref, r.guidance) },
-}
-
-// onSent is the turn effects the command line applies, in the order each
-// phase runs them.
-var onSent = []onSentEffect{
-	{name: builtin.EffectGuidanceHanded, on: map[route]effectRun{routeSession: keepsGuidance, routeAsked: keepsGuidance}},
-	{name: builtin.EffectRoundSent, on: map[route]effectRun{routeSession: {sent: func(r *sentRound) {
-		r.env.recordEvent(r.ctx, r.ref, dinv.KindRoundSent, withInstructions(handInSession, r.id))
-	}}}},
-}
-
-type phase func(c effectRun, r *sentRound)
-
-func guidePhase(c effectRun, r *sentRound) { runCell(c.guide, r) }
-
-func sentPhase(c effectRun, r *sentRound) { runCell(c.sent, r) }
-
-func unsentPhase(c effectRun, r *sentRound) { runCell(c.unsent, r) }
-
-func runCell(f func(r *sentRound), r *sentRound) {
-	if f != nil {
-		f(r)
-	}
-}
-
-// runPhase runs p of the host's turn effects d names, on route rt.
-func runPhase(rt route, d dintent.Def, r *sentRound, p phase) {
-	for _, e := range onSent {
-		if slices.Contains(d.Effects, e.name) {
-			p(e.on[rt], r)
-		}
-	}
-}
-
 // pluginEffects are the turn effects of d the plugin of u applies.
 func pluginEffects(d dintent.Def, u unit.Unit) []string {
 	var names []string
 	for _, name := range d.Effects {
-		hosts := slices.ContainsFunc(onSent, func(h onSentEffect) bool { return h.name == name })
+		hosts := slices.ContainsFunc(hostEffects, func(h hostEffect) bool { return h.name == name })
 		if fx, ok := builtin.EffectOf(name); ok && !hosts && fx.Plugin && fx.Provider == u.Provider && fx.Applies&builtin.AppliesTurn != 0 {
 			names = append(names, name)
 		}
@@ -142,27 +53,26 @@ func pluginEffects(d dintent.Def, u unit.Unit) []string {
 	return names
 }
 
-// checkEffects refuses, before a turn of d on u goes out, one whose plugin
-// effects no running plugin applies.
+// checkEffects stops, before a turn of d on u goes out, one whose plugin
+// effects no running plugin applies: src.ErrUnavailable, since its plugin
+// may run again.
 func (e *Env) checkEffects(d dintent.Def, u unit.Unit) error {
 	names := pluginEffects(d, u)
 	if len(names) == 0 {
 		return nil
 	}
 	if _, ok := e.turnEffects(u.Provider); !ok {
-		return fmt.Errorf("%s: no running plugin applies %s; the turn was not sent", u.Label(), strings.Join(names, ", "))
+		return fmt.Errorf("%s: no running plugin applies %s; the turn was not sent: %w", u.Label(), strings.Join(names, ", "), src.ErrUnavailable)
 	}
 	return nil
 }
 
-// applySentEffects applies the turn effects of d once r went out on route
-// rt: the host's sent phase, then, through ApplyEffect, those of the plugin
-// of r's unit. The turn is out whatever they answer: an effect that fails,
-// or that its plugin does not apply, is a health problem the daemon shows
-// until the next turn of the unit applies it.
-func (e *Env) applySentEffects(ctx context.Context, rt route, d dintent.Def, r *sentRound) {
-	runPhase(rt, d, r, sentPhase)
-	u := r.ref.Unit()
+// applyPluginEffects applies, through ApplyEffect, the turn effects of d the
+// plugin of u applies, to the turn sent describes. The turn is out
+// whatever they answer: an effect that fails, or that its plugin does not
+// apply, is a health problem the daemon shows until the next turn of the
+// unit applies it.
+func (e *Env) applyPluginEffects(ctx context.Context, d dintent.Def, u unit.Unit, sent src.EffectRequest, turnInputs map[string]any) {
 	names := pluginEffects(d, u)
 	if len(names) == 0 {
 		return
@@ -174,27 +84,23 @@ func (e *Env) applySentEffects(ctx context.Context, rt route, d dintent.Def, r *
 		}
 		return
 	}
-	head := ""
-	if r.pr != nil {
-		head = r.pr.HeadRefOid
-	}
 	var inputs json.RawMessage
-	if len(r.inputs) > 0 {
+	if len(turnInputs) > 0 {
 		var err error
-		if inputs, err = json.Marshal(r.inputs); err != nil {
-			fmt.Fprintf(e.Err, "warning: %s: the turn's inputs: %v\n", r.ref, err)
+		if inputs, err = json.Marshal(turnInputs); err != nil {
+			fmt.Fprintf(e.Err, "warning: %s: the turn's inputs: %v\n", u.Label(), err)
 		}
 	}
 	for _, name := range names {
-		req := src.EffectRequest{Effect: name, Unit: psource.Wire(u), Turn: &src.TurnRef{ID: r.id, Head: head}, Route: rt.wire(), Taken: r.submitted,
-			Inputs: inputs}
+		req := sent
+		req.Effect, req.Unit, req.Inputs = name, psource.Wire(u), inputs
 		err := a.ApplyEffect(context.WithoutCancel(ctx), req)
 		switch {
 		case errors.Is(err, src.ErrUnsupported):
 			e.effectProblems.set(u, name, fmt.Sprintf("%s: the plugin applies no %s, which the turn that went out names: %v", u.Label(), name, err))
 		case err != nil:
 			e.effectProblems.set(u, name, fmt.Sprintf("%s: applying %s to the turn that went out: %v", u.Label(), name, err))
-			fmt.Fprintf(e.Err, "warning: %s: applying %s: %v\n", r.ref, name, err)
+			fmt.Fprintf(e.Err, "warning: %s: applying %s: %v\n", u.Label(), name, err)
 		default:
 			e.effectProblems.set(u, name, "")
 		}
@@ -242,8 +148,9 @@ type roundRun struct {
 	cfg config.Config
 	r   turn.Request
 	pr  *pr.PullRequest
-	// resumeOf is the turn a resume continues, 0 for a new round.
-	resumeOf int64
+	// turn is the turn the round records: a new one its start admitted, or
+	// a resume.
+	turn turns.Turn
 	// st is the round state of a round asked for by hand; nil on a resume.
 	st *round.Store
 	// rememberHome is the agent home to keep for the pull request's next
@@ -353,20 +260,12 @@ func cliBuiltins() map[string][]string {
 	return map[string][]string{
 		string(builtin.SlotWorkspace): append(slices.Sorted(maps.Keys(workspaceRuns())), "given"),
 		string(builtin.SlotBefore):    {beforeTakeOver},
-		"effects":                     onSentNames(),
+		"effects":                     hostEffectNames(),
 		"policy":                      slices.Sorted(maps.Keys(policies)),
 		"context":                     {contextPR, builtin.ContextSynthetic},
 		"launch":                      {"", builtin.LaunchProbe},
 		"reconcile":                   {"", turns.ReconcileMyReview},
 	}
-}
-
-func onSentNames() []string {
-	names := make([]string, len(onSent))
-	for i, e := range onSent {
-		names[i] = e.name
-	}
-	return names
 }
 
 // options are the session options the round's manifest asks for.

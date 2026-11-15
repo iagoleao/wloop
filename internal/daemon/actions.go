@@ -16,6 +16,7 @@ import (
 	"github.com/wloophq/wloop/internal/catalog"
 	"github.com/wloophq/wloop/internal/core/gates"
 	"github.com/wloophq/wloop/internal/core/intake"
+	"github.com/wloophq/wloop/internal/core/lock"
 	"github.com/wloophq/wloop/internal/core/port"
 	"github.com/wloophq/wloop/internal/core/turns"
 	dintent "github.com/wloophq/wloop/internal/domain/intent"
@@ -23,6 +24,7 @@ import (
 	"github.com/wloophq/wloop/internal/domain/unit"
 	intentload "github.com/wloophq/wloop/internal/intent"
 	"github.com/wloophq/wloop/internal/intent/builtin"
+	src "github.com/wloophq/wloop/pkg/plugin/source"
 )
 
 // Actions are the operations with side effects outside the store. The daemon
@@ -112,8 +114,6 @@ type Call struct {
 type AheadPreparer interface {
 	PrepareAhead(ctx context.Context, name string, u unit.Unit, c Call) error
 }
-
-const askedByYou = "asked by you"
 
 var (
 	errActionsUnavailable = errors.New("actions unavailable")
@@ -517,7 +517,8 @@ func writeActionError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, missing.msg)
 	case errors.Is(err, gates.ErrRefused), errors.Is(err, gates.ErrIntent), errors.Is(err, gates.ErrNoGate), errors.Is(err, gates.ErrResolved):
 		writeGateError(w, err)
-	case errors.Is(err, errActionsUnavailable), errors.Is(err, errTurnsUnavailable), errors.Is(err, errPlanUnavailable), errors.Is(err, turns.ErrNoIntents):
+	case errors.Is(err, errActionsUnavailable), errors.Is(err, errTurnsUnavailable), errors.Is(err, errPlanUnavailable), errors.Is(err, turns.ErrNoIntents),
+		errors.Is(err, src.ErrUnavailable), errors.Is(err, turns.ErrTransient):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -597,19 +598,14 @@ func (s *Server) act(ctx context.Context, name string, u unit.Unit, req api.Acti
 	return s.delegate(ctx, d, u, call)
 }
 
-// delegate runs d on u with call: under the loop when it writes to it, the
-// pending round dropped first when it sends one, its event recorded after.
+// delegate runs d on u with call, under the loop when it writes to it,
+// and records its event after.
 func (s *Server) delegate(ctx context.Context, d delegated, u unit.Unit, call Call) error {
-	if d.loop && !LoopHeld(ctx) {
+	if d.loop && !lock.Held(ctx) {
 		ctx = s.readAhead(ctx, u, d.full)
 		s.deps.LoopMu.Lock()
 		defer s.deps.LoopMu.Unlock()
-		ctx = withLoopHeld(ctx)
-	}
-	if d.event == builtin.EventRoundSent {
-		if err := s.dropPending(ctx, u, askedByYou); err != nil {
-			return err
-		}
+		ctx = lock.WithHeld(ctx)
 	}
 	if err := d.call(s.deps.Actions, ctx, u, call); err != nil {
 		return err
@@ -620,10 +616,8 @@ func (s *Server) delegate(ctx context.Context, d delegated, u unit.Unit, call Ca
 	return s.recordEvent(ctx, u, d.event, d.data)
 }
 
-// actIntent runs a round of an intent as its manifest declares it: under
-// the loop, the pending round dropped first when its effects say so, its
-// prepare run, its guidance cut at guidance.max, and the events its effects
-// name recorded after it.
+// actIntent asks Actions for a turn of an intent, under the loop: the turn's
+// start cuts its guidance, runs its prepare and applies its effects.
 func (s *Server) actIntent(ctx context.Context, name string, u unit.Unit, req api.ActionRequest, out io.Writer) error {
 	d, err := intentDef(s.loaded(), name)
 	if err != nil {
@@ -636,42 +630,20 @@ func (s *Server) actIntent(ctx context.Context, name string, u unit.Unit, req ap
 	if err != nil {
 		return badRequest{err.Error()}
 	}
-	call := Call{Guidance: cutGuidance(d, req.Guidance), AgentHome: req.AgentHome, Out: out, Inputs: inputs, Items: req.Items, Task: req.Task,
+	call := Call{Guidance: req.Guidance, AgentHome: req.AgentHome, Out: out, Inputs: inputs, Items: req.Items, Task: req.Task,
 		Manager: req.Manager, Parent: req.Parent}
-	if a, ok := s.deps.Actions.(AheadPreparer); ok && !LoopHeld(ctx) {
+	if a, ok := s.deps.Actions.(AheadPreparer); ok && !lock.Held(ctx) {
 		if err := a.PrepareAhead(ctx, name, u, call); err != nil {
 			return err
 		}
 	}
-	if !LoopHeld(ctx) {
+	if !lock.Held(ctx) {
 		ctx = s.readAhead(ctx, u, false)
 		s.deps.LoopMu.Lock()
 		defer s.deps.LoopMu.Unlock()
+		ctx = lock.WithHeld(ctx)
 	}
-	effects := actionEffectsOf(d)
-	for _, e := range effects {
-		if e.before != nil {
-			if err := e.before(s, ctx, u); err != nil {
-				return err
-			}
-		}
-	}
-	if d.Prepare != "" {
-		if err := s.prepare(ctx, d, u, &call); err != nil {
-			return err
-		}
-	}
-	if err := s.deps.Actions.Intent(ctx, name, u, call); err != nil {
-		return err
-	}
-	for _, e := range effects {
-		if e.after != nil {
-			if err := e.after(s, ctx, u); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return s.deps.Actions.Intent(ctx, name, u, call)
 }
 
 // applyHold sets or clears the user's hold of u's rounds, records it, and

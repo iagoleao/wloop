@@ -27,15 +27,16 @@ import (
 	"github.com/wloophq/wloop/internal/turn"
 )
 
-// serveHeadless serves headless turns on d: their usage goes to turn_usage, an answer to a headless turn's
+// serveHeadless serves headless turns on d, each new one started by starter: their usage goes to turn_usage, an answer to a headless turn's
 // question runs it again, and the headless turns a stop cut short end failed before any new one starts.
-func (e *Env) serveHeadless(ctx context.Context, d daemon.Deps, db *sqlite.DB, cfg config.Config, mods []pluginModule, logf func(string, ...any)) daemon.Deps {
+func (e *Env) serveHeadless(ctx context.Context, d daemon.Deps, db *sqlite.DB, cfg config.Config, starter *turns.Starter, logf func(string, ...any)) daemon.Deps {
 	if e.Turns == nil || db == nil {
 		return d
 	}
 	ledger := e.itemsLedger(db, cfg, logf)
 	svc := &headless.Service{
 		Turns:   e.Turns,
+		Starter: starter,
 		Build:   headlessBuilder{e: e, cfg: cfg},
 		Place:   headlessPlacer{e: e, cfg: cfg},
 		Asker:   lazyAsker{e: e, cfg: cfg, dir: filepath.Join(e.StateDir, "headless")},
@@ -168,8 +169,8 @@ type headlessBuilder struct {
 	cfg config.Config
 }
 
-func (b headlessBuilder) Instructions(ctx context.Context, u unit.Unit, intent dturn.Intent, _ []string) (string, error) {
-	r := turn.Request{Intent: turn.Intent(intent), Trigger: turn.ByHand, Unit: u}
+func (b headlessBuilder) Instructions(ctx context.Context, u unit.Unit, intent dturn.Intent, _ []string, inputs map[string]any) (string, error) {
+	r := turn.Request{Intent: turn.Intent(intent), Trigger: turn.ByHand, Unit: u, Inputs: inputs}
 	if _, ok := b.e.payloadReaders()[u.Provider]; !ok {
 		r.Payload = unitPayload{u}
 	}

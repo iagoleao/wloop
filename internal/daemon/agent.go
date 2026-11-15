@@ -6,18 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/wloophq/wloop/internal/core/lock"
 	"github.com/wloophq/wloop/internal/core/messages"
 	"github.com/wloophq/wloop/internal/intent/builtin"
 
 	"github.com/wloophq/wloop/internal/api"
 	"github.com/wloophq/wloop/internal/core/turns"
-	dintent "github.com/wloophq/wloop/internal/domain/intent"
 	"github.com/wloophq/wloop/internal/domain/record"
 	"github.com/wloophq/wloop/internal/domain/unit"
 	"github.com/wloophq/wloop/internal/meter"
@@ -115,6 +115,25 @@ func writeAgentError(w http.ResponseWriter, err error) {
 	default:
 		writeActionError(w, err)
 	}
+}
+
+// writeByHandError answers a turn by hand's error as writeAgentError does,
+// with the notes of what the loop did before it, such as the guidance it
+// kept back, beside the error.
+func writeByHandError(w http.ResponseWriter, err error, notes []string) {
+	if len(notes) == 0 {
+		writeAgentError(w, err)
+		return
+	}
+	b := &bufferedResponse{header: w.Header(), code: http.StatusOK}
+	writeAgentError(b, err)
+	body := map[string]any{}
+	if json.Unmarshal(b.body.Bytes(), &body) != nil {
+		body = map[string]any{"error": strings.TrimSpace(b.body.String())}
+	}
+	body["notes"] = notes
+	w.WriteHeader(b.code)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (s *Server) handleTurnStart(w http.ResponseWriter, r *http.Request) {
@@ -219,28 +238,18 @@ func (s *Server) handleTurnByHand(w http.ResponseWriter, r *http.Request) {
 		writeAgentError(w, err)
 		return
 	}
-	req.Guidance = cutGuidance(d, req.Guidance)
-	intake := s.intakes != nil && s.deps.ByHandRef != nil && d.Intake && d.Brief.Wait
-	var u unit.Unit
-	if intake || d.Prepare != "" {
-		if u, err = s.byHandRef(ctx, req, handle); err != nil {
+	if s.intakes != nil && s.deps.ByHandRef != nil && d.Intake && d.Brief.Wait {
+		u, err := s.byHandRef(ctx, req, handle)
+		if err != nil {
 			writeAgentError(w, err)
 			return
 		}
-	}
-	if d.Prepare != "" {
-		if req, err = s.prepareByHand(ctx, d, u, req); err != nil {
-			writeAgentError(w, err)
-			return
-		}
-	}
-	if intake {
 		s.turnByHandIntake(w, ctx, d, u, req, handle)
 		return
 	}
 	res, err := s.deps.TurnByHand(ctx, req, handle)
 	if err != nil {
-		writeAgentError(w, err)
+		writeByHandError(w, err, res.Notes)
 		return
 	}
 	writeJSON(w, res)
@@ -254,17 +263,6 @@ func (s *Server) byHandRef(ctx context.Context, req api.ByHandRequest, handle st
 		return s.deps.ByHandRef(ctx, req, handle)
 	}
 	return unitOfAddress(s.deps.Units, req.URL)
-}
-
-// prepareByHand runs the intent's prepare for a turn by hand, whose
-// request then carries what it filled.
-func (s *Server) prepareByHand(ctx context.Context, d dintent.Def, u unit.Unit, req api.ByHandRequest) (api.ByHandRequest, error) {
-	c := Call{Guidance: req.Guidance, Inputs: maps.Clone(req.Inputs)}
-	if err := s.prepare(ctx, d, u, &c); err != nil {
-		return req, err
-	}
-	req.Guidance, req.Inputs = c.Guidance, c.Inputs
-	return req, nil
 }
 
 func (s *Server) handleTurnEnd(w http.ResponseWriter, r *http.Request) {
@@ -441,10 +439,11 @@ func (s *Server) deliverStopped(ctx context.Context, handle string) error {
 	}
 	if s.deps.LoopMu.TryLock() {
 		defer s.deps.LoopMu.Unlock()
-		return t.DeliverStopped(ctx, handle)
+		return t.DeliverStopped(lock.WithHeld(ctx), handle)
 	}
 	s.deps.LoopMu.Lock()
 	defer s.deps.LoopMu.Unlock()
+	ctx = lock.WithHeld(ctx)
 	b, ok, err := t.Store.BookOf(ctx, turns.Key{Session: handle})
 	if err != nil || !ok {
 		return err

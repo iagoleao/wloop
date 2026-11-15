@@ -86,8 +86,12 @@ func (a *asker) Ask(_ context.Context, q turns.Ask) (turns.Answer, error) {
 
 type builder struct{}
 
-func (builder) Instructions(_ context.Context, u unit.Unit, i turn.Intent, its []string) (string, error) {
-	return "# Act on " + u.Key + " for " + string(i) + " on " + strings.Join(its, ","), nil
+func (builder) Instructions(_ context.Context, u unit.Unit, i turn.Intent, its []string, inputs map[string]any) (string, error) {
+	text := "# Act on " + u.Key + " for " + string(i) + " on " + strings.Join(its, ",")
+	if who, ok := inputs["who"].(string); ok {
+		text += ", asking " + who
+	}
+	return text, nil
 }
 
 type placer struct{ dir string }
@@ -136,7 +140,8 @@ func newRig(t *testing.T, script ...scripted) *rig {
 	r.svc = &headless.Service{Turns: r.turns, Build: builder{}, Place: placer{dir: "/work/checkout"}, Asker: r.asker, Ledger: r.ledger, Outbox: r.outbox,
 		Intents: func(n turn.Intent) (dintent.Def, bool) { return reg.Get(dintent.Name(n)) },
 		Default: func(p unit.ProviderID) (dintent.Def, bool) { return reg.ByRole("headless", p) },
-		Caps:    headless.Caps{PerCallUSD: 0.5, PerDayUSD: 5}, Spent: r.spent, Clock: r.clock, Go: func(run func()) { run() }, Log: t.Logf}
+		Caps:    headless.Caps{PerCallUSD: 0.5, PerDayUSD: 5}, Spent: r.spent, Clock: r.clock, Go: func(run func()) { run() }, Log: t.Logf,
+		Starter: turnstest.Starter(turnstest.Defs{Registry: reg}, r.store, nil)}
 	w := bundledWrapper(t)
 	r.svc.Wrapper = func() (headless.Wrapper, error) { return w, nil }
 	r.turns.Headless = r.svc.Again
@@ -156,8 +161,8 @@ func (r *rig) spent(ctx context.Context, day time.Time) (float64, error) {
 
 type noLauncher struct{}
 
-func (noLauncher) Launch(context.Context, turns.Launch) error {
-	return errors.New("a headless turn never launches a session")
+func (noLauncher) Launch(context.Context, turns.Launch) (turns.Outcome, error) {
+	return turns.Outcome{}, errors.New("a headless turn never launches a session")
 }
 
 func (r *rig) book(t *testing.T, u unit.Unit) turn.Book {
@@ -231,14 +236,14 @@ func TestHeadlessRunIsATurn(t *testing.T) {
 func TestOneHeadlessRunPerUnit(t *testing.T) {
 	r := newRig(t, scripted{json: answerJSON(t, done)})
 	ctx := context.Background()
-	if _, err := r.turns.BeginHeadless(ctx, turns.HeadlessStart{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "first", Trigger: turn.ByHand}); err != nil {
+	if _, err := turnstest.BeginHeadless(ctx, r.turns, turns.HeadlessStart{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "first", Trigger: turn.ByHand}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.svc.Run(ctx, headless.Request{Unit: thread}); !errors.Is(err, headless.ErrBusy) {
 		t.Fatalf("second run: %v", err)
 	}
 	other := &headless.Service{Turns: r.newTurns(), Build: r.svc.Build, Place: r.svc.Place, Asker: r.svc.Asker, Ledger: r.svc.Ledger, Outbox: r.svc.Outbox,
-		Intents: r.svc.Intents, Default: r.svc.Default, Caps: r.svc.Caps, Spent: r.svc.Spent, Clock: r.svc.Clock, Wrapper: r.svc.Wrapper}
+		Intents: r.svc.Intents, Default: r.svc.Default, Caps: r.svc.Caps, Spent: r.svc.Spent, Clock: r.svc.Clock, Wrapper: r.svc.Wrapper, Starter: r.svc.Starter}
 	if _, err := other.Run(ctx, headless.Request{Unit: thread}); !errors.Is(err, headless.ErrBusy) {
 		t.Fatalf("a second service: %v", err)
 	}
@@ -250,7 +255,7 @@ func TestOneHeadlessRunPerUnit(t *testing.T) {
 func TestHeadlessTurnInterruptedByRestart(t *testing.T) {
 	r := newRig(t)
 	ctx := context.Background()
-	seq, err := r.turns.BeginHeadless(ctx, turns.HeadlessStart{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "cut", Trigger: turn.ByHand, Items: []string{"i1"}})
+	seq, err := turnstest.BeginHeadless(ctx, r.turns, turns.HeadlessStart{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "cut", Trigger: turn.ByHand, Items: []string{"i1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,12 +277,12 @@ func TestSessionPathsSkipHeadlessTurns(t *testing.T) {
 	r := newRig(t)
 	r.turns.Usage = nil
 	ctx := context.Background()
-	started, err := r.turns.BeginHeadless(ctx, turns.HeadlessStart{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "live", Trigger: turn.ByHand})
+	started, err := turnstest.BeginHeadless(ctx, r.turns, turns.HeadlessStart{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "live", Trigger: turn.ByHand})
 	if err != nil {
 		t.Fatal(err)
 	}
 	other := unit.Unit{Provider: "thread", Key: "C1/1700000000.000200"}
-	if _, err := r.turns.BeginHeadless(ctx, turns.HeadlessStart{Unit: other, Intent: turn.Intent(dintent.Act), Turn: "ended", Trigger: turn.ByHand}); err != nil {
+	if _, err := turnstest.BeginHeadless(ctx, r.turns, turns.HeadlessStart{Unit: other, Intent: turn.Intent(dintent.Act), Turn: "ended", Trigger: turn.ByHand}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.turns.EndHeadless(ctx, mustSeq(t, r, other), turns.HeadlessEnd{Err: errors.New("boom")}); err != nil {
@@ -555,5 +560,33 @@ func TestHeadlessAnswerRunsAgain(t *testing.T) {
 	}
 	if typed := r.sess.Typed(); len(typed) != 0 {
 		t.Fatalf("typed into a session: %+v", typed)
+	}
+}
+
+func TestAHeadlessRunRendersAndKeepsItsInputsAndItsRunAgainToo(t *testing.T) {
+	r := newRig(t, scripted{json: answerJSON(t, asked())}, scripted{json: answerJSON(t, done)})
+	ctx := context.Background()
+	if _, err := r.svc.Run(ctx, headless.Request{Unit: thread, Items: []string{"i1"}, Inputs: map[string]any{"who": "ana"}, Trigger: turn.Automated}); err != nil {
+		t.Fatal(err)
+	}
+	m := r.inbox()
+	if err := m.Reconcile(ctx, thread); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Gates.(*messagestest.Gates).Answer(ctx, questions(t, m)[0], messages.Answer{OptionID: "mon", Source: turn.Cockpit}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.asker.asks) != 2 {
+		t.Fatalf("%d asks", len(r.asker.asks))
+	}
+	for i, a := range r.asker.asks {
+		if !strings.Contains(a.Prompt, "asking ana") {
+			t.Errorf("call %d never rendered its inputs:\n%s", i, a.Prompt)
+		}
+	}
+	for _, tu := range r.book(t, thread).Turns {
+		if tu.Inputs["who"] != "ana" || !slices.Equal(turns.ItemsOf(tu), []string{"i1"}) {
+			t.Errorf("turn %d inputs %v", tu.Seq, tu.Inputs)
+		}
 	}
 }

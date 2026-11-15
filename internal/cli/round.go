@@ -39,8 +39,8 @@ type roundOptions struct {
 	confirmed bool
 	// keepLive sends to the live session however long it has been idle.
 	keepLive bool
-	// resumeOf is the turn the round's turn resumes, 0 for none.
-	resumeOf int64
+	// turn is the admitted turn the round records.
+	turn turns.Turn
 	// trusted is the pull request's verdict from trusts.
 	trusted bool
 	// busy refuses the round, rather than start a session beside the live
@@ -128,9 +128,6 @@ func (e *Env) startRound(ctx context.Context, cfg config.Config, ws wsdomain.Wor
 // the PR goes in the prompt and keeps the live session, which knows it.
 func (e *Env) startAddress(ctx context.Context, cfg config.Config, ws wsdomain.Workspace, r turn.Request, opts roundOptions) (submitted bool, verb, turnID string, err error) {
 	ref := prOf(r.Unit)
-	if err := e.roundReady(); err != nil {
-		return false, "", "", err
-	}
 	activity, err := e.freshActivity(ctx)
 	if err != nil {
 		return false, "", "", err
@@ -159,15 +156,13 @@ func (e *Env) startAddress(ctx context.Context, cfg config.Config, ws wsdomain.W
 		verb = "prompt queued in the busy agent session"
 	}
 	r.Owned, r.Local, r.Queued = true, local, queued
-	sent, err := e.sendTurn(ctx, cfg, r)
+	sent, err := e.sendTurn(ctx, cfg, opts.turn, r)
 	if err != nil {
 		return false, "", "", err
 	}
-	sent.resume(opts.resumeOf)
 	submitted, err = e.deliver(ctx, r.Unit, &sent, p, queued)
-	e.recordGuidance(ctx, ref, r.Guidance)
 	if err != nil {
-		return false, "", "", err
+		return false, "", sent.ID, err
 	}
 	if err := e.roundStarted(ctx, r.Unit, func() error { return e.setColumn(ctx, cfg, ws, config.ColumnInProgress) }); err != nil {
 		fmt.Fprintf(e.Err, "warning: %s: setting the board status: %v\n", ws.DisplayName, err)
@@ -648,7 +643,7 @@ func (e *Env) awaitCapable(ctx context.Context, id, home string) error {
 // stays started; one whose prompt could not be typed is withdrawn.
 func (e *Env) deliver(ctx context.Context, u unit.Unit, sent *sentTurn, p proc, queued bool) (bool, error) {
 	if sent.send != nil {
-		t, err := e.Turns.Send(ctx, *sent.send)
+		t, err := e.Turns.Send(ctx, sent.turn, *sent.send)
 		if err != nil {
 			return false, err
 		}
@@ -792,20 +787,6 @@ func (e *Env) roundStarted(ctx context.Context, u unit.Unit, noViews func() erro
 
 func (e *Env) stamp() string { return e.Now().Format(time.DateTime) }
 
-// handGuidance is the guidance of a round asked for by hand: the user's, else
-// the guidance kept from a round that did not go out. Either way the kept one
-// is used up.
-func (e *Env) handGuidance(ctx context.Context, ref pr.Ref, guidance string) string {
-	if e.Rec == nil {
-		return guidance
-	}
-	kept, err := e.Rec.TakeNextGuidance(ctx, ref)
-	if err != nil {
-		fmt.Fprintf(e.Err, "warning: %s: reading the guidance kept for this round: %v\n", ref, err)
-	}
-	return cmp.Or(guidance, kept)
-}
-
 // recordGuidance records the guidance a round's prompt carried, so the
 // text survives a prompt that never reached the agent.
 func (e *Env) recordGuidance(ctx context.Context, ref pr.Ref, guidance string) {
@@ -829,5 +810,11 @@ func (e *Env) keepGuidance(ctx context.Context, ref pr.Ref, guidance string) {
 		fmt.Fprintf(e.Err, "warning: %s: keeping your guidance for the next round: %v\n", ref, err)
 		return
 	}
+	e.noteKeptBack(ref)
+}
+
+// noteKeptBack tells the person that the guidance of ref's round that did
+// not go out is kept for its next round.
+func (e *Env) noteKeptBack(ref pr.Ref) {
 	fmt.Fprintf(e.Out, "%s: your guidance is kept for the next round\n", ref)
 }

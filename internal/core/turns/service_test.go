@@ -51,8 +51,10 @@ func (c *clock) advance(d time.Duration) {
 }
 
 type recorder struct {
-	mu        sync.Mutex
-	launches  []turns.Launch
+	mu       sync.Mutex
+	launches []turns.Launch
+	// admitted are the turns of launches, which launches keep without.
+	admitted  []turns.Turn
 	launchErr error
 	attempts  int
 	reviews   map[unit.Unit][]turns.SourceAnswer
@@ -60,15 +62,17 @@ type recorder struct {
 	changes   []unit.Unit
 }
 
-func (r *recorder) Launch(_ context.Context, l turns.Launch) error {
+func (r *recorder) Launch(_ context.Context, l turns.Launch) (turns.Outcome, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.attempts++
 	if r.launchErr != nil {
-		return r.launchErr
+		return turns.Outcome{}, r.launchErr
 	}
+	r.admitted = append(r.admitted, l.Turn)
+	l.Turn = turns.Turn{}
 	r.launches = append(r.launches, l)
-	return nil
+	return turns.Outcome{Submitted: true}, nil
 }
 
 func (r *recorder) Answers(_ context.Context, u unit.Unit, since time.Time) ([]turns.SourceAnswer, error) {
@@ -133,7 +137,7 @@ func TestAnAutomatedSendWaitsForTheAnswerOnItsWay(t *testing.T) {
 	asked := store.Put(turn.Book{Unit: r7, Turns: []turn.Turn{{Intent: turn.Intent(dintent.Review), ID: "q", Trigger: turn.Automated, State: turn.Asked, Head: "c1", SentAt: t0.Add(-time.Hour)}},
 		Answers: []turn.Answer{{TurnSeq: 1, Text: "publish it", Route: turn.Typed, At: t0.Add(-time.Minute)}}})
 	req := turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Head: "c2", Records: true}
-	if _, err := s.Send(ctx, req); !refusal(err, "has an answer on its way") {
+	if _, err := turnstest.Send(ctx, s, req); !refusal(err, "has an answer on its way") {
 		t.Fatalf("send = %v", err)
 	}
 	if b := bookOf(t, store, r7); len(b.Turns) != 1 || b.Turns[0].State != turn.Asked {
@@ -141,12 +145,12 @@ func TestAnAutomatedSendWaitsForTheAnswerOnItsWay(t *testing.T) {
 	}
 	byHand := req
 	byHand.Trigger, byHand.Turn = turn.ByHand, "by-hand"
-	if _, err := s.Send(ctx, byHand); err != nil {
+	if _, err := turnstest.Send(ctx, s, byHand); err != nil {
 		t.Fatalf("a round by hand: %v", err)
 	}
 	store.Put(asked)
 	req.ResumeOf = asked.Turns[0].Seq
-	if _, err := s.Send(ctx, req); err != nil {
+	if _, err := turnstest.Send(ctx, s, req); err != nil {
 		t.Fatalf("the resume of the answered question: %v", err)
 	}
 }
@@ -155,7 +159,7 @@ func TestWithdrawUndoesTheSend(t *testing.T) {
 	s, store, _, _, rec := newService(t)
 	ctx := context.Background()
 	asked := store.Put(turn.Book{Unit: r7, Turns: []turn.Turn{{Intent: turn.Intent(dintent.Review), ID: "q", Trigger: turn.Automated, State: turn.Asked, SentAt: t0.Add(-time.Hour)}}})
-	if _, err := s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, ResumeOf: asked.Turns[0].Seq, Records: true}); err != nil {
+	if _, err := turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, ResumeOf: asked.Turns[0].Seq, Records: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Withdraw(ctx, r7, "abc", "typing the prompt: orca is down"); err != nil {
@@ -189,7 +193,7 @@ func TestWithdrawUndoesTheSend(t *testing.T) {
 func TestSendSkipsTextsThatAskForNoRecord(t *testing.T) {
 	s, store, _, _, rec := newService(t)
 	ctx := context.Background()
-	got, err := s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: false})
+	got, err := turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: false})
 	if err != nil || !reflect.DeepEqual(got, turn.Turn{}) {
 		t.Fatalf("a dry run: %+v %v", got, err)
 	}
@@ -197,11 +201,11 @@ func TestSendSkipsTextsThatAskForNoRecord(t *testing.T) {
 		t.Fatalf("a dry run stored %+v, events %+v", b, store.Events())
 	}
 
-	first, err := s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Guidance: "look at the migration", Head: "h1", Records: true})
+	first, err := turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Guidance: "look at the migration", Head: "h1", Records: true})
 	if err != nil || first.Seq == 0 || first.State != turn.Sent || first.Head != "h1" || first.Guidance != "look at the migration" || !first.SentAt.Equal(t0) {
 		t.Fatalf("sent %+v %v", first, err)
 	}
-	if _, err := s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "def", Trigger: turn.ByHand, Records: true}); err != nil {
+	if _, err := turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "def", Trigger: turn.ByHand, Records: true}); err != nil {
 		t.Fatal(err)
 	}
 	b := bookOf(t, store, r7)
@@ -219,7 +223,7 @@ func TestSendSkipsTextsThatAskForNoRecord(t *testing.T) {
 func TestStartOnTheSessionTheTurnWasSentTo(t *testing.T) {
 	s, store, _, _, _ := newService(t)
 	ctx := context.Background()
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
 	if err := s.SentTo(ctx, r7, "abc", "term_1"); err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +247,7 @@ func TestStartOnTheSessionTheTurnWasSentTo(t *testing.T) {
 		t.Fatalf("an unknown round: %v", err)
 	}
 
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Address), Turn: "def", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Address), Turn: "def", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, r7, "def", "term_1")
 	moved, err := s.Start(ctx, "term_2", "def")
 	if err != nil || moved.Session != "term_2" || moved.SentTo != "term_1" {
@@ -266,7 +270,7 @@ func TestRecordTurnEndChecksTheCallingSession(t *testing.T) {
 	s, store, reg, _, rec := newService(t)
 	ctx := context.Background()
 	reg.Put(turn.Session{ID: "term_1", MCPAt: t0})
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: "review", Turn: "abc", Trigger: "automated", Head: "h1", Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: "review", Turn: "abc", Trigger: "automated", Head: "h1", Records: true})
 	s.SentTo(ctx, r7, "abc", "term_1")
 	if _, err := s.Start(ctx, "term_1", "abc"); err != nil {
 		t.Fatal(err)
@@ -333,10 +337,10 @@ func TestAnIdenticalReAskAfterATypedAnswerIsStored(t *testing.T) {
 func TestRecordTurnEndRefusesAnOlderTurnOfTheSession(t *testing.T) {
 	s, _, _, _, _ := newService(t)
 	ctx := context.Background()
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, r7, "abc", "term_1")
 	s.Start(ctx, "term_1", "abc")
-	s.Send(ctx, turns.SendRequest{Unit: ref(8), Intent: turn.Intent(dintent.Address), Turn: "def", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: ref(8), Intent: turn.Intent(dintent.Address), Turn: "def", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, ref(8), "def", "term_1")
 	done := record.Record{State: record.Failed, Summary: "broke", Resume: "the build fails"}
 	if _, err := s.RecordTurnEnd(ctx, turns.RecordRequest{Session: "term_1", Turn: "abc", Record: done}); !refusal(err, "this session's turn is now def") {
@@ -350,7 +354,7 @@ func TestRecordTurnEndRefusesAnOlderTurnOfTheSession(t *testing.T) {
 func TestRecordTurnEndByHandOutsideOrca(t *testing.T) {
 	s, store, _, _, _ := newService(t)
 	ctx := context.Background()
-	started, err := s.StartByHand(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.ByHand, Head: "h1", Records: true}, "")
+	started, err := turnstest.StartByHand(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.ByHand, Head: "h1", Records: true}, "")
 	if err != nil || started.State != turn.Started || started.Session != "" {
 		t.Fatalf("by hand: %+v %v", started, err)
 	}
@@ -909,14 +913,14 @@ func TestReconcileFastJob(t *testing.T) {
 func TestALateRecordNamesTheTurnThatReplacedIt(t *testing.T) {
 	s, _, _, _, _ := newService(t)
 	ctx := context.Background()
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, r7, "abc", "term_1")
 	s.Start(ctx, "term_1", "abc")
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "def", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "def", Trigger: turn.Automated, Records: true})
 	if err := s.Withdraw(ctx, r7, "def", "orca is down"); err != nil {
 		t.Fatal(err)
 	}
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "ghi", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "ghi", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, r7, "ghi", "term_2")
 	got, err := s.RecordTurnEnd(ctx, turns.RecordRequest{Session: "term_1", Turn: "abc", Record: record.Record{State: record.Settled, Summary: "nothing new"}})
 	if err != nil || got.Note != "this turn was replaced by turn ghi; your record changes nothing" {
@@ -927,10 +931,10 @@ func TestALateRecordNamesTheTurnThatReplacedIt(t *testing.T) {
 func TestRecordTurnEndOnAReplacedOrDismissedTurn(t *testing.T) {
 	s, store, _, _, rec := newService(t)
 	ctx := context.Background()
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, r7, "abc", "term_1")
 	s.Start(ctx, "term_1", "abc")
-	s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "def", Trigger: turn.Automated, Records: true})
+	turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "def", Trigger: turn.Automated, Records: true})
 	s.SentTo(ctx, r7, "def", "term_1")
 	changes, ended := len(rec.changes), len(kinds(store.Events(), turns.KindTurnEnded))
 	settled := record.Record{State: record.Settled, Summary: "nothing new"}
@@ -1038,7 +1042,7 @@ func (onlyDone) Rules(string) (dintent.RecordRules, error) {
 func startedTurn(t *testing.T, s *turns.Service, intent turn.Intent) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := s.Send(ctx, turns.SendRequest{Unit: r7, Intent: intent, Turn: "abc", Trigger: turn.Automated, Records: true}); err != nil {
+	if _, err := turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: intent, Turn: "abc", Trigger: turn.Automated, Records: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SentTo(ctx, r7, "abc", "term_1"); err != nil {
@@ -1170,7 +1174,7 @@ func TestALaunchCarriesANonGitHubUnit(t *testing.T) {
 func TestSendKeepsTheItemsAndTaskItWasAskedAbout(t *testing.T) {
 	s, store, _, _, _ := newService(t)
 	ctx := context.Background()
-	if _, err := s.Send(ctx, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.ByHand, Records: true,
+	if _, err := turnstest.Send(ctx, s, turns.SendRequest{Unit: r7, Intent: turn.Intent(dintent.Review), Turn: "abc", Trigger: turn.ByHand, Records: true,
 		Inputs: map[string]any{"depth": "deep"}, Items: []string{"i1", "i2"}, Task: "t-1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1212,5 +1216,41 @@ func TestAGateReplayRoutesTheAnswerTheDaemonStoppedBeforeRouting(t *testing.T) {
 	}
 	if _, err := s.Answer(context.Background(), turns.AnswerRequest{Unit: r7, OptionID: "publish", Gate: 4, Source: turn.Cockpit}); err != nil || len(rec.launches) != 1 {
 		t.Fatalf("a routed answer replayed again: %v, launches %d", err, len(rec.launches))
+	}
+}
+
+func TestALaunchIsAPersonsOnlyWhenItsEntrySaysSo(t *testing.T) {
+	thread := unit.Unit{Provider: "thread", Key: "C1 thread 9"}
+	for _, c := range []struct {
+		name string
+		l    turns.Launch
+		want int
+	}{
+		{"asked by a person, automated", turns.Launch{Unit: thread, Intent: turn.Intent(dintent.Review), Trigger: turn.Automated, ByPerson: true}, 1},
+		{"by hand, not asked by a person", turns.Launch{Unit: thread, Intent: turn.Intent(dintent.Review), Trigger: turn.ByHand}, 0},
+	} {
+		s, store, _, _, _ := newService(t)
+		fx := &turnstest.Effects{}
+		s.Starter = turnstest.Starter(turnstest.Defs{Registry: turnstest.Intents()}, store, nil)
+		s.Starter.Effects = fx
+		if err := s.Launch(context.Background(), c.l); err != nil {
+			t.Fatal(err)
+		}
+		if got := fx.Befores(); got != c.want {
+			t.Errorf("%s: %d before phases, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+func TestALaunchThatResumesAnAutomatedTurnsSessionKeepsItsOwnTrigger(t *testing.T) {
+	s, store, _, _, rec := newService(t)
+	putTurn(store, false)
+	s.Starter = turnstest.Starter(turnstest.Defs{Registry: turnstest.Intents()}, store, nil)
+	l := turns.Launch{Unit: r7, Intent: turn.Intent(dintent.Review), Trigger: turn.ByHand, ResumeOf: 1}
+	if err := s.Launch(context.Background(), l); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.admitted) != 1 || rec.admitted[0].Trigger() != turn.ByHand {
+		t.Errorf("admitted %+v, want trigger %s", rec.admitted, turn.ByHand)
 	}
 }

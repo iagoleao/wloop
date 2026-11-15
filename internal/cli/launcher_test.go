@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/wloophq/wloop/internal/core/port"
 	"github.com/wloophq/wloop/internal/core/turns"
 	dintent "github.com/wloophq/wloop/internal/domain/intent"
+	dinv "github.com/wloophq/wloop/internal/domain/inventory"
 	"github.com/wloophq/wloop/internal/domain/pr"
 	"github.com/wloophq/wloop/internal/domain/record"
 	dturn "github.com/wloophq/wloop/internal/domain/turn"
@@ -57,7 +59,7 @@ func TestResumeRecreatesTheAuthorWorkspace(t *testing.T) {
 	te.git.ancestor["/worktrees/feat/mine"] = true
 	seq := stoppedAddress(t, te)
 
-	err := cliLauncher{te.Env}.Launch(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"})
+	_, err := te.launchAdmitted(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, te.err)
 	}
@@ -92,7 +94,7 @@ func TestAResumeKeepsTheSelfReview(t *testing.T) {
 	te.git.ancestor["/worktrees/feat/mine"] = true
 	seq := stoppedAddressWith(t, te, map[string]any{"self_review": true})
 
-	err := cliLauncher{te.Env}.Launch(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"})
+	_, err := te.launchAdmitted(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, te.err)
 	}
@@ -118,7 +120,7 @@ func TestResumeRefusesUnpushedCommits(t *testing.T) {
 	te.git.tips["feat/mine"] = "local1"
 	seq := stoppedAddress(t, te)
 
-	err := cliLauncher{te.Env}.Launch(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"})
+	_, err := te.launchAdmitted(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"})
 	if err == nil || !strings.Contains(err.Error(), "local branch feat/mine has commits not on the PR") {
 		t.Fatalf("err = %v", err)
 	}
@@ -143,7 +145,7 @@ func TestResumeOfAReviewRunsInTheReviewWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	seq := saved.Turns[0].Seq
-	if err := (cliLauncher{te.Env}).Launch(ctx, turns.Launch{Unit: ref.Unit(), Intent: dturn.Intent(dintent.Review), ResumeOf: seq, Answer: "publish"}); err != nil {
+	if _, err := te.launchAdmitted(ctx, turns.Launch{Unit: ref.Unit(), Intent: dturn.Intent(dintent.Review), ResumeOf: seq, Answer: "publish"}); err != nil {
 		t.Fatalf("%v\n%s", err, te.err)
 	}
 	if len(m.Prompts) != 1 || m.Prompts[0].Handle != "term-rev" {
@@ -154,14 +156,44 @@ func TestResumeOfAReviewRunsInTheReviewWorkspace(t *testing.T) {
 	}
 }
 
+func TestAResumedReviewRecordsTheGuidanceItCarries(t *testing.T) {
+	t.Parallel()
+	m := warmReviewWorkspace()
+	te := newTestEnv(t, m)
+	te.gh.basics = openBasics
+	rec := &memRecorder{}
+	te.Rec = rec
+	ctx := context.Background()
+	ref := pr.Ref(r7)
+	saved, err := te.repo.Save(ctx, dturn.Book{Unit: ref.Unit(), Turns: []dturn.Turn{{Intent: dturn.Intent(dintent.Review), ID: "r0", Trigger: dturn.ByHand, Head: "c1",
+		Guidance: "check the migration", State: dturn.Unrecorded, SentAt: testNow}}}, port.Event{Unit: ref.Unit(), Kind: turns.KindTurnSent, Key: "r0", At: testNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := te.launchAdmitted(ctx, turns.Launch{Unit: ref.Unit(), Intent: dturn.Intent(dintent.Review), ResumeOf: saved.Turns[0].Seq, Answer: "publish"}); err != nil {
+		t.Fatalf("%v\n%s", err, te.err)
+	}
+	var handed []string
+	for _, ev := range rec.events {
+		if ev.Kind == dinv.KindGuidance {
+			handed = append(handed, ev.Data)
+		}
+	}
+	if !slices.Equal(handed, []string{"check the migration"}) {
+		t.Fatalf("guidance events %q", handed)
+	}
+}
+
 // askedIntent runs a round of the intent the user asked for through the
-// daemon's action, as envActions.Intent does.
+// daemon's action, as envActions.Intent does, with the inputs its prepare
+// would fill given.
 func askedIntent(e *Env, cfg config.Config, ref pr.Ref, name dintent.Name, guidance string, inputs map[string]any, home string) error {
 	d, ok := e.loadedIntents().Registry.Get(name)
 	if !ok {
 		return fmt.Errorf("no intent %s", name)
 	}
-	return e.askedRound(context.Background(), d, cfg, ref, guidance, inputs, home)
+	e.Turns.Starter.Preparer = startPreparer{&fakePreparer{}}
+	return e.askedRound(context.Background(), d, cfg, ref, guidance, inputs, home, "")
 }
 
 func nudgePR(_ context.Context, e *Env, cfg config.Config, ref pr.Ref, situation string, maintainers bool, guidance, home string) error {

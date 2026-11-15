@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+
+	"github.com/wloophq/wloop/internal/core/lock"
 	"testing"
 	"time"
 
@@ -22,6 +24,8 @@ import (
 type fakeHost struct {
 	mu    sync.Mutex
 	calls []string
+	// wokeHeld records, per wake, whether its context marks the loop held.
+	wokeHeld []bool
 }
 
 func (h *fakeHost) Focus(_ context.Context, manager, workspaceID string) error {
@@ -31,9 +35,10 @@ func (h *fakeHost) Focus(_ context.Context, manager, workspaceID string) error {
 	return nil
 }
 
-func (h *fakeHost) Wake(_ context.Context, u unit.Unit, intent string, sess turn.Session) error {
+func (h *fakeHost) Wake(ctx context.Context, u unit.Unit, intent string, sess turn.Session) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.wokeHeld = append(h.wokeHeld, lock.Held(ctx))
 	h.calls = append(h.calls, "wake "+u.String()+" "+intent+" "+sess.ID+" "+sess.AgentSession)
 	return nil
 }
@@ -96,7 +101,7 @@ func (r *runsRig) sessionAt(t *testing.T, id, handle, agentSession string, start
 
 func (r *runsRig) start(t *testing.T, id, session string) turn.Turn {
 	t.Helper()
-	got, err := r.svc.StartByHand(context.Background(), turns.SendRequest{Unit: r.u, Intent: "start", Turn: id, Trigger: turn.ByHand, Records: true}, session)
+	got, err := turnstest.StartByHand(context.Background(), r.svc, turns.SendRequest{Unit: r.u, Intent: "start", Turn: id, Trigger: turn.ByHand, Records: true}, session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +147,7 @@ func TestOpenFocusesTheRunsWorkspace(t *testing.T) {
 	if got := r.host.seen(); !slices.Equal(got, []string{"focus orca ws-1"}) {
 		t.Fatalf("host calls %v", got)
 	}
-	headless, err := r.svc.Send(context.Background(), turns.SendRequest{Unit: r.u, Intent: "act", Turn: "turn-2", Trigger: turn.ByHand, Records: true})
+	headless, err := turnstest.Send(context.Background(), r.svc, turns.SendRequest{Unit: r.u, Intent: "act", Turn: "turn-2", Trigger: turn.ByHand, Records: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +178,9 @@ func TestEnterWakesADormantSession(t *testing.T) {
 	want := []string{"focus orca ws-1", "wake " + r.u.String() + " start s2 ag-2", "focus orca ws-1"}
 	if got := r.host.seen(); !slices.Equal(got, want) {
 		t.Fatalf("a dormant session: host calls %v, want %v", got, want)
+	}
+	if !slices.Equal(r.host.wokeHeld, []bool{true}) {
+		t.Fatalf("woke with the loop marked held %v", r.host.wokeHeld)
 	}
 }
 

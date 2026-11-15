@@ -145,7 +145,7 @@ func ServeForTest(t testing.TB, o TestOptions) *TestDaemon {
 	deps := serveDeps(ctx, e, db, cfg, logf, loopMu, &daemon.AppState{})
 	deps.Startup, deps.StateDir = nil, e.StateDir
 	deps.Socket, deps.LockPath, deps.InfoPath = e.Socket, filepath.Join(dir, daemonLock), filepath.Join(dir, httpInfoFile)
-	srv := daemon.New(deps)
+	srv := e.newDaemon(deps)
 	e.Briefing, e.consequences = srv, srv
 	e.linkStates.Store(srv)
 	done := make(chan error, 1)
@@ -251,11 +251,55 @@ func (d *TestDaemon) Start(t testing.TB, u unit.Unit, intent string) TestSession
 	if err := d.e.Turns.MCPSeen(d.ctx, s.Handle); err != nil {
 		t.Fatalf("session %s: %v", s.Handle, err)
 	}
-	r := turns.SendRequest{Unit: u, Intent: dturn.Intent(intent), Turn: s.Round, Trigger: dturn.ByHand, Records: true, Agent: "echo"}
-	if _, err := d.e.Turns.StartByHand(d.ctx, r, id); err != nil {
+	x := testSessionTurn{turns: d.e.Turns, r: turns.SendRequest{Turn: s.Round, Records: true, Agent: "echo"}, handle: id}
+	if _, err := d.sessionStarter().Start(d.ctx, turns.Request{Unit: u, Intent: dturn.Intent(intent), Trigger: dturn.ByHand, Route: src.RouteSession}, x); err != nil {
 		t.Fatalf("starting a %s turn on %s: %v", intent, u.Label(), err)
 	}
 	return s
+}
+
+// sessionStarter is the daemon's starter for a test session's turn, whose
+// plugin effects apply only when the test daemon runs the unit's plugin.
+func (d *TestDaemon) sessionStarter() *turns.Starter {
+	s := *d.e.Turns.Starter
+	s.Effects = runningPluginEffects{TurnEffects: s.Effects, e: d.e}
+	return &s
+}
+
+// runningPluginEffects are the turn effects of a unit whose plugin runs;
+// none of a plugin's when it does not.
+type runningPluginEffects struct {
+	turns.TurnEffects
+	e *Env
+}
+
+func (f runningPluginEffects) Check(ctx context.Context, d turns.Def, u unit.Unit) error {
+	if _, ok := f.e.turnEffects(u.Provider); !ok {
+		return nil
+	}
+	return f.TurnEffects.Check(ctx, d, u)
+}
+
+func (f runningPluginEffects) Recorded(ctx context.Context, o turns.TurnOut) error {
+	if _, ok := f.e.turnEffects(o.Unit.Provider); !ok {
+		return nil
+	}
+	return f.TurnEffects.Recorded(ctx, o)
+}
+
+// testSessionTurn records the turn of a test session that asked for it by
+// hand, rendering nothing.
+type testSessionTurn struct {
+	turns  *turns.Service
+	r      turns.SendRequest
+	handle string
+}
+
+func (x testSessionTurn) Run(ctx context.Context, t turns.Turn) (turns.Outcome, error) {
+	if _, err := x.turns.StartByHand(ctx, t, x.r, x.handle); err != nil {
+		return turns.Outcome{}, err
+	}
+	return turns.Outcome{ID: x.r.Turn, Submitted: true}, nil
 }
 
 // EndTurn records the end of s's turn, as the agent's turn_end call does.

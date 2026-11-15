@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,7 +74,7 @@ func agentServer(t *testing.T) (*Server, *turns.Service) {
 func sendTurn(t *testing.T, s *Server, svc *turns.Service, ref pr.Ref, intent turn.Intent, round string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := svc.Send(ctx, turns.SendRequest{Unit: ref.Unit(), Intent: intent, Turn: round, Trigger: turn.Automated, Head: "h2", Records: true}); err != nil {
+	if _, err := turnstest.Send(ctx, svc, turns.SendRequest{Unit: ref.Unit(), Intent: intent, Turn: round, Trigger: turn.Automated, Head: "h2", Records: true}); err != nil {
 		t.Fatal(err)
 	}
 	stored := dinv.StoredTurn{ID: round, Kind: string(intent), Repo: ref.Owner + "/" + ref.Repo, Text: "Instructions " + round + " for " + string(intent) + "\n"}
@@ -470,5 +471,30 @@ func TestTurnAnswerReadsTheAnswersOfAGate(t *testing.T) {
 	}
 	if rec := agentCall(t, h, "GET", path+"&gate=999", "term_1", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("no such gate: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestATurnByHandErrorCarriesItsNotesAndKeepsItsStatus(t *testing.T) {
+	for name, c := range map[string]struct {
+		err  error
+		code int
+	}{
+		"bad request": {badRequest{"nothing new to review"}, http.StatusBadRequest},
+		"refusal":     {turns.Refusal{Reason: "the task is done"}, http.StatusConflict},
+		"failure":     {errors.New("the agent is gone"), http.StatusInternalServerError},
+	} {
+		w := httptest.NewRecorder()
+		writeByHandError(w, c.err, []string{"acme/api#7: your guidance is kept for the next round"})
+		var body struct {
+			Error string   `json:"error"`
+			Notes []string `json:"notes"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if w.Code != c.code || !strings.Contains(c.err.Error(), body.Error) || body.Error == "" ||
+			!slices.Equal(body.Notes, []string{"acme/api#7: your guidance is kept for the next round"}) {
+			t.Errorf("%s: %d %+v, want %d", name, w.Code, body, c.code)
+		}
 	}
 }

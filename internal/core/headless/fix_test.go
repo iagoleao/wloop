@@ -10,6 +10,7 @@ import (
 	"github.com/wloophq/wloop/internal/core/headless"
 	"github.com/wloophq/wloop/internal/core/outbox"
 	"github.com/wloophq/wloop/internal/core/turns"
+	"github.com/wloophq/wloop/internal/core/turns/turnstest"
 	dintent "github.com/wloophq/wloop/internal/domain/intent"
 	"github.com/wloophq/wloop/internal/domain/turn"
 	"github.com/wloophq/wloop/internal/domain/unit"
@@ -60,7 +61,7 @@ func TestASessionTurnNeverReplacesAStartedHeadlessOne(t *testing.T) {
 	if _, err := r.svc.Start(ctx, headless.Request{Unit: thread}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := r.turns.Send(ctx, turns.SendRequest{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "session", Trigger: turn.ByHand, Records: true})
+	_, err := turnstest.Send(ctx, r.turns, turns.SendRequest{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "session", Trigger: turn.ByHand, Records: true})
 	if !errors.Is(err, headless.ErrBusy) {
 		t.Fatalf("a session send over a started headless turn: %v", err)
 	}
@@ -73,7 +74,7 @@ func TestASessionTurnNeverReplacesAStartedHeadlessOne(t *testing.T) {
 func TestAHeadlessRunNeverReplacesAnOpenSessionTurn(t *testing.T) {
 	r := newRig(t, scripted{json: answerJSON(t, done)})
 	ctx := context.Background()
-	if _, err := r.turns.Send(ctx, turns.SendRequest{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "session", Trigger: turn.ByHand, Records: true}); err != nil {
+	if _, err := turnstest.Send(ctx, r.turns, turns.SendRequest{Unit: thread, Intent: turn.Intent(dintent.Act), Turn: "session", Trigger: turn.ByHand, Records: true}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.svc.Run(ctx, headless.Request{Unit: thread}); !errors.Is(err, headless.ErrBusy) {
@@ -163,7 +164,7 @@ func TestTheDailyCapCountsStartedTurnsOfAnEarlierService(t *testing.T) {
 		t.Fatal(err)
 	}
 	rebuilt := &headless.Service{Turns: r.turns, Build: r.svc.Build, Place: r.svc.Place, Asker: r.svc.Asker, Ledger: r.svc.Ledger, Outbox: r.svc.Outbox,
-		Intents: r.svc.Intents, Default: r.svc.Default, Caps: r.svc.Caps, Spent: r.svc.Spent, Clock: r.svc.Clock, Wrapper: r.svc.Wrapper}
+		Intents: r.svc.Intents, Default: r.svc.Default, Caps: r.svc.Caps, Spent: r.svc.Spent, Clock: r.svc.Clock, Wrapper: r.svc.Wrapper, Starter: r.svc.Starter}
 	if _, err := rebuilt.Start(ctx, headless.Request{Unit: otherThread}); !errors.Is(err, headless.ErrOverCap) {
 		t.Fatalf("a rebuilt service ignored the call in flight: %v", err)
 	}

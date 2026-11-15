@@ -165,56 +165,53 @@ func TestAProfileEditReachesTheCatalogWithoutARestart(t *testing.T) {
 	}
 }
 
-func TestPrepareRunsOnBothRoutes(t *testing.T) {
+func TestPrepareRunsOnTheActionRoute(t *testing.T) {
 	t.Parallel()
-	wantInputs := func(t *testing.T, in map[string]any) {
-		t.Helper()
-		situation, _ := in["situation"].(string)
-		who, _ := in["who"].([]string)
-		maintainers, isBool := in["waits_on_maintainers"].(bool)
-		if !strings.HasPrefix(situation, "Waiting on: @ana since ") || !slices.Equal(who, []string{"@ana"}) || !isBool || maintainers {
-			t.Fatalf("inputs %#v", in)
-		}
+	s := newServer(t)
+	seedWaitingOnAna(t, s)
+	fa := startingActions(s)
+	s.deps.Actions = fa
+	if rec := post(t, s, "/api/units/github/acme%2Fapi%239/nudge", `{"guidance":"g","source":"cli"}`); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
-	t.Run("action", func(t *testing.T) {
-		s := newServer(t)
-		seedWaitingOnAna(t, s)
-		fa := &fakeActions{}
-		s.deps.Actions = fa
-		if rec := post(t, s, "/api/units/github/acme%2Fapi%239/nudge", `{"guidance":"g","source":"cli"}`); rec.Code != 200 {
-			t.Fatalf("%d %s", rec.Code, rec.Body)
+	in := fa.inputs[0]
+	situation, _ := in["situation"].(string)
+	who, _ := in["who"].([]string)
+	maintainers, isBool := in["waits_on_maintainers"].(bool)
+	if !strings.HasPrefix(situation, "Waiting on: @ana since ") || !slices.Equal(who, []string{"@ana"}) || !isBool || maintainers {
+		t.Fatalf("inputs %#v", in)
+	}
+}
+
+func TestATurnByHandLeavesThePrepareAndTheCutToItsStart(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var asked []api.ByHandRequest
+	s, _ := newIntakeServer(t, intaketest.NewBriefs(waitBriefing), func(d *Deps) {
+		d.TurnByHand = func(_ context.Context, r api.ByHandRequest, _ string) (api.ByHandResult, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked = append(asked, r)
+			return api.ByHandResult{Text: "the nudge"}, nil
 		}
-		wantInputs(t, fa.inputs[0])
+		d.ByHandRef = func(context.Context, api.ByHandRequest, string) (unit.Unit, error) { return r9.Unit(), nil }
+		d.SessionWait = time.Hour
 	})
-	t.Run("session", func(t *testing.T) {
-		var mu sync.Mutex
-		var asked []api.ByHandRequest
-		s, _ := newIntakeServer(t, intaketest.NewBriefs(waitBriefing), func(d *Deps) {
-			d.TurnByHand = func(_ context.Context, r api.ByHandRequest, _ string) (api.ByHandResult, error) {
-				mu.Lock()
-				defer mu.Unlock()
-				asked = append(asked, r)
-				return api.ByHandResult{Text: "the nudge"}, nil
-			}
-			d.ByHandRef = func(context.Context, api.ByHandRequest, string) (unit.Unit, error) { return r9.Unit(), nil }
-			d.SessionWait = time.Hour
-		})
-		seedWaitingOnAna(t, s)
-		rec := httptest.NewRecorder()
-		req := apiRequest("POST", api.AgentTurnsByHand, strings.NewReader(`{"intent":"nudge","cwd":"/w","guidance":"g"}`))
-		req.Header.Set(api.SessionHeader, "term-1")
-		s.Handler().ServeHTTP(rec, req)
-		if rec.Code != 200 {
-			t.Fatalf("a session nudge waited or failed: %d %s", rec.Code, rec.Body)
-		}
-		if len(asked) != 1 {
-			t.Fatalf("asked %+v", asked)
-		}
-		wantInputs(t, asked[0].Inputs)
-		if open, _ := s.deps.Intakes.Open(context.Background()); len(open) != 0 {
-			t.Fatalf("a session nudge went through an intake: %+v", open)
-		}
-	})
+	seedWaitingOnAna(t, s)
+	long := strings.Repeat("g", 600)
+	rec := httptest.NewRecorder()
+	req := apiRequest("POST", api.AgentTurnsByHand, strings.NewReader(`{"intent":"nudge","cwd":"/w","guidance":"`+long+`"}`))
+	req.Header.Set(api.SessionHeader, "term-1")
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("a session nudge waited or failed: %d %s", rec.Code, rec.Body)
+	}
+	if len(asked) != 1 || asked[0].Guidance != long || asked[0].Inputs["situation"] != nil {
+		t.Fatalf("asked %+v", asked)
+	}
+	if open, _ := s.deps.Intakes.Open(context.Background()); len(open) != 0 {
+		t.Fatalf("a session nudge went through an intake: %+v", open)
+	}
 }
 
 func TestAClientCannotSendAPrepareInput(t *testing.T) {
@@ -499,49 +496,6 @@ func TestNudgeRecordsOnlyDoneOrFailed(t *testing.T) {
 	rec = agentCall(t, h, "POST", api.AgentTurnsEnd, "term_1", `{"turn":"nudge1nudge1","pr":"`+agentRef.URL()+`","record":{"state":"done","summary":"nudged","outcome":{"url":"https://github.com/acme/api/pull/7#issuecomment-1"}}}`)
 	if rec.Code != 200 {
 		t.Fatalf("a done nudge: %d %s", rec.Code, rec.Body)
-	}
-}
-
-func TestActionRouteRunsTodaysEffects(t *testing.T) {
-	t.Parallel()
-	for _, c := range []struct {
-		intent    string
-		ref       github.Ref
-		dropped   bool
-		event     string
-		eventData string
-	}{
-		{"review", r7, true, dinv.KindRoundSent, askedByYou},
-		{"address", r7, true, dinv.KindRoundSent, askedByYou},
-		{"nudge", r9, false, "", ""},
-	} {
-		t.Run(c.intent, func(t *testing.T) {
-			t.Parallel()
-			rig := newCatalogRig(t)
-			rig.s.intakes = nil
-			fa := &fakeActions{}
-			rig.s.deps.Actions = fa
-			seedWaitingOnAna(t, rig.s)
-			adopt(t, rig.s, r7)
-			rig.plan.propose(c.ref.Unit())
-			path := api.UnitPath(pr.Ref{Owner: "acme", Repo: "api", Number: c.ref.Number}.Unit(), c.intent)
-			if rec := post(t, rig.s, path, `{"source":"cli"}`); rec.Code != 200 {
-				t.Fatalf("%d %s", rec.Code, rec.Body)
-			}
-			if pending := rig.plan.isPending(c.ref.Unit()); pending == c.dropped {
-				t.Errorf("pending round after the %s: %v", c.intent, pending)
-			}
-			evs, _ := rig.st.Events(context.Background(), c.ref)
-			if c.event != "" && !slices.ContainsFunc(evs, func(e dinv.Event) bool { return e.Kind == c.event && e.Data == c.eventData }) {
-				t.Errorf("no %s %q: %+v", c.event, c.eventData, evs)
-			}
-			if c.event == "" && slices.ContainsFunc(evs, func(e dinv.Event) bool { return e.Kind == dinv.KindNudged }) {
-				t.Errorf("the daemon recorded a nudge the command line records with its turn: %+v", evs)
-			}
-			if len(fa.calls) != 1 {
-				t.Errorf("calls %v", fa.calls)
-			}
-		})
 	}
 }
 

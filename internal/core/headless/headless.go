@@ -32,10 +32,13 @@ type Request struct {
 	Task     string
 	Intent   turn.Intent // "" is the Service's Default
 	Guidance string
+	Inputs   map[string]any
 	Trigger  turn.Trigger
 	Workflow string // "" by hand
 	// ResumeOf is the headless turn whose question this run answers, 0 none.
 	ResumeOf int64
+	// ByPerson is a turn a person asked for, whatever its Trigger.
+	ByPerson bool
 }
 
 type Result struct {
@@ -48,7 +51,7 @@ type Result struct {
 
 // Builder renders a unit's instructions for an intent; implemented in internal/cli over internal/turn.
 type Builder interface {
-	Instructions(ctx context.Context, u unit.Unit, intent turn.Intent, items []string) (string, error)
+	Instructions(ctx context.Context, u unit.Unit, intent turn.Intent, items []string, inputs map[string]any) (string, error)
 }
 
 // Placer resolves a placement to an existing directory, implemented in internal/cli:
@@ -66,9 +69,11 @@ type Caps struct {
 
 type Service struct {
 	Turns *turns.Service // records the turn; its Items ledger applies the record's ops with provenance turn
-	Build Builder
-	Place Placer
-	Asker turns.Asker
+	// Starter admits each new turn; a run again resumes through it.
+	Starter *turns.Starter
+	Build   Builder
+	Place   Placer
+	Asker   turns.Asker
 	// Ledger reads the unit's items, which a draft's items must name; nil checks none.
 	Ledger  items.Applier
 	Outbox  *outbox.Service
@@ -125,27 +130,80 @@ func Schema() string {
 
 // started is a headless turn stored and ready to call.
 type started struct {
-	seq int64
-	req Request
-	def intent.Def
-	ask turns.Ask
+	seq  int64
+	turn string
+	req  Request
+	def  intent.Def
+	ask  turns.Ask
 }
 
-// Run stores the turn, calls the agent and records its answer; it passes turns.ErrNoRestricted through.
+// Run admits and stores the turn, calls the agent and records its answer; it passes turns.ErrNoRestricted through.
 func (s *Service) Run(ctx context.Context, r Request) (Result, error) {
-	st, err := s.begin(ctx, r)
+	st, err := s.admit(ctx, r)
 	if err != nil {
 		return Result{}, err
 	}
 	return s.finish(ctx, st)
 }
 
-// Start stores the turn and runs its call in the background; the turn's seq is known once it returns.
+// Start admits and stores the turn and runs its call in the background; the turn's seq is known once it returns.
 func (s *Service) Start(ctx context.Context, r Request) (int64, error) {
-	st, err := s.begin(ctx, r)
+	st, err := s.admit(ctx, r)
 	if err != nil {
 		return 0, err
 	}
+	s.background(st)
+	return st.seq, nil
+}
+
+// admit starts r's turn through the Starter, which runs the intent's role
+// and effects around the turn's record.
+func (s *Service) admit(ctx context.Context, r Request) (started, error) {
+	if s.Starter == nil {
+		return started{}, errors.New("no turn starter is wired")
+	}
+	if r.Intent == "" && s.Default != nil {
+		if d, ok := s.Default(r.Unit.Provider); ok {
+			r.Intent = turn.Intent(d.Name)
+		}
+	}
+	if r.Trigger == "" {
+		r.Trigger = turn.ByHand
+	}
+	x := &runner{s: s, r: r}
+	if _, err := s.Starter.Start(ctx, turns.Request{Unit: r.Unit, Intent: r.Intent, Guidance: r.Guidance, Inputs: r.Inputs, Trigger: r.Trigger,
+		Route: turns.RouteLaunch, ByPerson: r.ByPerson}, x); err != nil {
+		return started{}, err
+	}
+	return x.st, nil
+}
+
+// runner is a headless turn as Start runs it: checked before any effect,
+// then rendered and stored with the guidance and inputs Start settled.
+type runner struct {
+	s  *Service
+	r  Request
+	st started
+}
+
+func (x *runner) Sessionless() bool { return true }
+
+func (x *runner) Guard(_ context.Context, t turns.Turn) error {
+	_, err := x.s.def(t.Unit(), t.Intent())
+	return err
+}
+
+func (x *runner) Run(ctx context.Context, t turns.Turn) (turns.Outcome, error) {
+	st, err := x.s.begin(ctx, t, x.r)
+	if err != nil {
+		return turns.Outcome{}, err
+	}
+	x.st = st
+	return turns.Outcome{ID: st.turn, Submitted: true}, nil
+}
+
+// background runs st's call on its own.
+func (s *Service) background(st started) {
 	bg := s.Context
 	if bg == nil {
 		bg = context.Background()
@@ -160,23 +218,30 @@ func (s *Service) Start(ctx context.Context, r Request) (int64, error) {
 	} else {
 		go run()
 	}
-	return st.seq, nil
 }
 
-// Again runs q's intent on q's unit, items and task (kept in q.Inputs) with said as Guidance, q.Trigger
-// and q.Workflow; ErrNotHeadless when q.Mode is not headless. The route is Resumed.
+// Again resumes q through the Starter and runs its intent on q's unit, items, task and inputs with said as
+// Guidance, q.Trigger and q.Workflow; ErrNotHeadless when q.Mode is not headless. The route is Resumed.
 func (s *Service) Again(ctx context.Context, q turn.Turn, said string) (turns.AnswerResult, error) {
 	if q.Runner != turn.RunnerHeadless {
 		return turns.AnswerResult{}, ErrNotHeadless
+	}
+	if s.Starter == nil {
+		return turns.AnswerResult{}, errors.New("no turn starter is wired")
 	}
 	u, err := s.unitOf(ctx, q)
 	if err != nil {
 		return turns.AnswerResult{}, err
 	}
-	if _, err := s.Start(ctx, Request{Unit: u, Items: turns.ItemsOf(q), Task: turns.TaskOf(q), Intent: q.Intent, Guidance: said,
-		Trigger: q.Trigger, Workflow: q.Workflow, ResumeOf: q.Seq}); err != nil {
+	t, err := s.Starter.ResumeAnswered(ctx, u, q.Seq, said)
+	if err != nil {
 		return turns.AnswerResult{}, err
 	}
+	st, err := s.begin(ctx, t, Request{Items: turns.ItemsOf(q), Task: turns.TaskOf(q), Workflow: q.Workflow})
+	if err != nil {
+		return turns.AnswerResult{}, err
+	}
+	s.background(st)
 	return turns.AnswerResult{Route: turn.Resumed}, nil
 }
 
@@ -191,23 +256,27 @@ func (s *Service) unitOf(ctx context.Context, q turn.Turn) (unit.Unit, error) {
 	return b.Unit, nil
 }
 
-func (s *Service) begin(ctx context.Context, r Request) (started, error) {
-	if r.Intent == "" && s.Default != nil {
-		if d, ok := s.Default(r.Unit.Provider); ok {
-			r.Intent = turn.Intent(d.Name)
-		}
-	}
-	if r.Trigger == "" {
-		r.Trigger = turn.ByHand
-	}
-	def, ok := s.Intents(r.Intent)
+// def is intent's definition when it runs headless on u.
+func (s *Service) def(u unit.Unit, name turn.Intent) (intent.Def, error) {
+	def, ok := s.Intents(name)
 	switch {
 	case !ok:
-		return started{}, fmt.Errorf("no intent %s", r.Intent)
+		return def, fmt.Errorf("no intent %s", name)
 	case !def.Runs(string(turn.RunnerHeadless)):
-		return started{}, fmt.Errorf("%w: %s does not run headless (its manifest's modes)", ErrNotHeadless, r.Intent)
-	case !def.Serves(r.Unit.Provider):
-		return started{}, fmt.Errorf("%s does not act on %s units", r.Intent, r.Unit.Provider)
+		return def, fmt.Errorf("%w: %s does not run headless (its manifest's modes)", ErrNotHeadless, name)
+	case !def.Serves(u.Provider):
+		return def, fmt.Errorf("%s does not act on %s units", name, u.Provider)
+	}
+	return def, nil
+}
+
+// begin renders and stores t, a new turn Start admitted or a resume, with
+// r's items, task and workflow.
+func (s *Service) begin(ctx context.Context, t turns.Turn, r Request) (started, error) {
+	r.Unit, r.Intent, r.Trigger, r.Guidance, r.Inputs, r.ResumeOf = t.Unit(), t.Intent(), t.Trigger(), t.Guidance(), t.Inputs(), t.ResumeOf()
+	def, err := s.def(r.Unit, r.Intent)
+	if err != nil {
+		return started{}, err
 	}
 	var first string
 	if len(r.Items) > 0 {
@@ -220,7 +289,7 @@ func (s *Service) begin(ctx context.Context, r Request) (started, error) {
 	if !placed {
 		dir = ""
 	}
-	text, err := s.Build.Instructions(ctx, r.Unit, r.Intent, r.Items)
+	text, err := s.Build.Instructions(ctx, r.Unit, r.Intent, r.Items, r.Inputs)
 	if err != nil {
 		return started{}, err
 	}
@@ -251,12 +320,12 @@ func (s *Service) begin(ctx context.Context, r Request) (started, error) {
 	if err := s.underCap(ctx); err != nil {
 		return started{}, err
 	}
-	seq, err := s.Turns.BeginHeadless(ctx, turns.HeadlessStart{Unit: r.Unit, Intent: r.Intent, Turn: randomHex(), Trigger: r.Trigger,
-		Guidance: r.Guidance, Workflow: r.Workflow, Role: def.Role, Items: r.Items, Task: r.Task, ResumeOf: r.ResumeOf})
+	id := randomHex()
+	seq, err := s.Turns.BeginHeadless(ctx, t, turns.HeadlessStart{Turn: id, Workflow: r.Workflow, Role: def.Role, Items: r.Items, Task: r.Task})
 	if err != nil {
 		return started{}, err
 	}
-	return started{seq: seq, req: r, def: def, ask: ask}, nil
+	return started{seq: seq, turn: id, req: r, def: def, ask: ask}, nil
 }
 
 func (s *Service) prompt(r Request, checkout, dossier, instructions string) (string, error) {

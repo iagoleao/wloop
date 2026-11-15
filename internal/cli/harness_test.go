@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/wloophq/wloop/internal/adapter/store/inventory/inventorytest"
+	"github.com/wloophq/wloop/internal/turn"
 
 	"github.com/wloophq/wloop/plugins/github/api/apitest"
 	ghpr "github.com/wloophq/wloop/plugins/github/pr"
@@ -679,6 +680,7 @@ func newTestEnv(t testing.TB, ws workspace.Manager) *testEnv {
 	te.Views = &views.Service{Books: te.repo, Intents: registryPort{te.Env}, State: te.repo, Sinks: []views.Sink{{ViewSink: te.sink, Placements: te.sink}}, Clock: clock, Paused: te.boardPaused}
 	te.Turns = &turns.Service{Intents: registryPort{te.Env}, Notices: profileNotices{te.Env}, Store: te.repo, Registry: te.reg, Sessions: turnstest.NewSessions(), Launcher: cliLauncher{te.Env},
 		Answers: hostAnswers{events: sqlite.New(db), viewer: te.Store}, Changed: te.Views.Changed, Clock: clock, Command: brand.Name, FastJob: 2 * time.Minute}
+	te.Turns.Starter = te.Env.turnStarter(&lock.Mutex{}, nil, nil)
 	var minted atomic.Int64
 	te.Turns.NewID = func() string { return fmt.Sprintf("sid-%d", minted.Add(1)) }
 	return te
@@ -797,7 +799,7 @@ func (te *testEnv) serveWith(t testing.TB, with func(daemon.Deps) daemon.Deps) {
 	t.Helper()
 	mu := &lock.Mutex{}
 	te.loop = mu
-	d := withRows(daemon.Deps{Pauses: te.Rounds, Turns: te.Turns, Views: te.Views, Actions: envActions{te.Env, te.Store}, Intents: te.loadedIntents, TurnByHand: te.byHand(mu), LoopMu: mu, Facts: te.prFacts(te.cfg),
+	d := withRows(daemon.Deps{Pauses: te.Rounds, Turns: te.Turns, Views: te.Views, Actions: envActions{te.Env, te.Store}, Intents: te.loadedIntents, TurnByHand: te.byHand(), LoopMu: mu, Facts: te.prFacts(te.cfg),
 		DryRunTurn: te.dryRunTurn, Doctor: te.doctorState,
 		Cfg: te.cfg, Version: "test", Now: te.Now, Identity: viewerIs("me"), Log: t.Logf}, te.Store)
 	d = withGitHub(d, present.Deps{Store: te.Store, Reports: te.Env.reports(te.Store), Host: te.moduleHost(te.db)(unit.GitHub),
@@ -808,6 +810,7 @@ func (te *testEnv) serveWith(t testing.TB, with func(daemon.Deps) daemon.Deps) {
 	}
 	srv := daemon.New(d)
 	te.Env.consequences = srv
+	te.Turns.Starter.Loop, te.Turns.Starter.Preparer = serveLoop{e: te.Env, mu: mu}, startPreparer{srv}
 	te.Socket = serveSocket(t, srv.Handler())
 }
 
@@ -1044,4 +1047,24 @@ func (r layeredReports) Reported(ctx context.Context, units []unit.Unit) (map[un
 	}
 	maps.Copy(out, kept)
 	return out, nil
+}
+
+// sendAdmitted is sendTurn of r as the turn its start admitted.
+func (e *Env) sendAdmitted(ctx context.Context, cfg config.Config, r turn.Request) (sentTurn, error) {
+	x := turnstest.Started(turns.Request{Unit: r.Unit, Intent: dturn.Intent(r.Intent), Guidance: r.Guidance, Inputs: r.Inputs, Trigger: turnTrigger(r.Trigger)})
+	return e.sendTurn(ctx, cfg, x, r)
+}
+
+// launchAdmitted launches l as the turn its start admitted, or its resume
+// when l resumes a turn.
+func (e *Env) launchAdmitted(ctx context.Context, l turns.Launch) (turns.Outcome, error) {
+	if l.ResumeOf == 0 {
+		l.Turn = turnstest.Started(turns.Request{Unit: l.Unit, Intent: l.Intent, Guidance: l.Guidance, Inputs: l.Inputs, Trigger: l.Trigger})
+	} else {
+		var err error
+		if l.Turn, err = (&turns.Starter{Store: e.Turns.Store}).Resume(ctx, l.Unit, l.ResumeOf); err != nil {
+			return turns.Outcome{}, err
+		}
+	}
+	return cliLauncher{e}.Launch(ctx, l)
 }

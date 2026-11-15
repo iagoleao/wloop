@@ -116,7 +116,8 @@ func (s *stepSet) unitStart(ctx context.Context, c stepCall, o automation.RunOpt
 }
 
 // startTurn starts an automated turn of a's intent on u in its runner: a
-// headless call, or a session where the intent runs.
+// headless call or a session where the intent runs, each through the turn's
+// start, which runs the role's prepare.
 func (s *stepSet) startTurn(ctx context.Context, u unit.Unit, a startArgs, guidance string, why *workflow.Why) (string, error) {
 	intent := dturn.Intent(a.intent)
 	if a.runnerName() == string(dturn.RunnerHeadless) {
@@ -128,7 +129,10 @@ func (s *stepSet) startTurn(ctx context.Context, u unit.Unit, a startArgs, guida
 		}
 		return "started a headless " + a.intent + " turn", nil
 	}
-	if err := (cliLauncher{s.e}).Launch(ctx, turns.Launch{Unit: u, Intent: intent, Guidance: guidance, Trigger: dturn.Automated, Why: why}); err != nil {
+	if s.e.Turns == nil {
+		return "", errors.New("no turn service is wired")
+	}
+	if err := s.e.Turns.Launch(ctx, turns.Launch{Unit: u, Intent: intent, Guidance: guidance, Trigger: dturn.Automated, Why: why}); err != nil {
 		return "", err
 	}
 	return "started a " + a.intent + " turn", nil

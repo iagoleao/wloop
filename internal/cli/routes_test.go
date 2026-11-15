@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"io"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -14,7 +15,7 @@ import (
 
 	"github.com/wloophq/wloop/internal/api"
 	"github.com/wloophq/wloop/internal/catalog"
-	"github.com/wloophq/wloop/internal/core/lock"
+	"github.com/wloophq/wloop/internal/core/automation"
 	"github.com/wloophq/wloop/internal/core/port"
 	"github.com/wloophq/wloop/internal/core/turns"
 	"github.com/wloophq/wloop/internal/daemon"
@@ -24,6 +25,7 @@ import (
 	dturn "github.com/wloophq/wloop/internal/domain/turn"
 	wsdomain "github.com/wloophq/wloop/internal/domain/workspace"
 	"github.com/wloophq/wloop/internal/workspace"
+	ghplan "github.com/wloophq/wloop/plugins/github/plan"
 )
 
 // effects are what a round left in the round state and the activity log.
@@ -38,7 +40,7 @@ func effectsOf(t *testing.T, te *testEnv, ref pr.Ref) effects {
 	t.Helper()
 	st := te.loadRounds(t)
 	key := ref.String()
-	got := effects{fingerprint: st.Mark(key, ghsource.MarkReviewed)+st.Mark(key, ghsource.MarkAddressedReviews) != "", checksHead: st.Mark(key, ghsource.MarkAddressedChecks), conflictHead: st.Mark(key, ghsource.MarkAddressedConflict)}
+	got := effects{fingerprint: st.Mark(key, ghplan.MarkReviewed)+st.Mark(key, ghsource.MarkAddressedReviews) != "", checksHead: st.Mark(key, ghsource.MarkAddressedChecks), conflictHead: st.Mark(key, ghsource.MarkAddressedConflict)}
 	evs, err := te.Store.Events(context.Background(), ref)
 	if err != nil {
 		t.Fatal(err)
@@ -72,8 +74,9 @@ func TestEachRouteRunsTodaysEffects(t *testing.T) {
 	byHand := func(intent dintent.Name, ws wsdomain.Workspace, inputs map[string]any) func(t *testing.T) (*testEnv, pr.Ref) {
 		return func(t *testing.T) (*testEnv, pr.Ref) {
 			_, te := handScenario(t, ws)
+			te.Turns.Starter.Preparer = startPreparer{&fakePreparer{}}
 			cwd := te.Harness.Cwd()
-			_, err := te.byHand(&lock.Mutex{})(ctx, api.ByHandRequest{Intent: string(intent), URL: r7.URL(), Cwd: cwd, Inputs: inputs}, "term_1")
+			_, err := te.byHand()(ctx, api.ByHandRequest{Intent: string(intent), URL: r7.URL(), Cwd: cwd, Inputs: inputs}, "term_1")
 			if err != nil {
 				t.Fatalf("%v\n%s", err, te.err)
 			}
@@ -89,7 +92,7 @@ func TestEachRouteRunsTodaysEffects(t *testing.T) {
 				t.Fatal(err)
 			}
 			seq := storedTurn(t, te, ref, intent, inputs)
-			if err := (cliLauncher{te.Env}).Launch(ctx, turns.Launch{Unit: pr.Ref(ref).Unit(), Intent: dturn.Intent(intent), ResumeOf: seq, Answer: "go on"}); err != nil {
+			if _, err := te.launchAdmitted(ctx, turns.Launch{Unit: pr.Ref(ref).Unit(), Intent: dturn.Intent(intent), ResumeOf: seq, Answer: "go on"}); err != nil {
 				t.Fatalf("%v\n%s", err, te.err)
 			}
 			return te, ref
@@ -155,7 +158,7 @@ func TestAResumeRestoresPersistedInputs(t *testing.T) {
 	te := newTestEnv(t, m)
 	te.gh.basics = openBasics
 	seq := storedTurn(t, te, r7, dintent.Nudge, nudgeInputs)
-	if err := (cliLauncher{te.Env}).Launch(context.Background(), turns.Launch{Unit: pr.Ref(r7).Unit(), Intent: dturn.Intent(dintent.Nudge), ResumeOf: seq, Answer: "go on"}); err != nil {
+	if _, err := te.launchAdmitted(context.Background(), turns.Launch{Unit: pr.Ref(r7).Unit(), Intent: dturn.Intent(dintent.Nudge), ResumeOf: seq, Answer: "go on"}); err != nil {
 		t.Fatalf("%v\n%s", err, te.err)
 	}
 	b := te.bookOf(t, r7)
@@ -207,10 +210,73 @@ func TestAResumeMarksAddressedWithoutRecordingTheRound(t *testing.T) {
 	te.git.branch["/worktrees/feat/mine"] = "feat/mine"
 	te.git.ancestor["/worktrees/feat/mine"] = true
 	seq := storedTurn(t, te, r21, dintent.Address, nil)
-	if err := (cliLauncher{te.Env}).Launch(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"}); err != nil {
+	if _, err := te.launchAdmitted(context.Background(), turns.Launch{Unit: pr.Ref(r21).Unit(), Intent: dturn.Intent(dintent.Address), ResumeOf: seq, Answer: "go on"}); err != nil {
 		t.Fatalf("%v\n%s", err, te.err)
 	}
 	if got := effectsOf(t, te, r21); !reflect.DeepEqual(got, effects{fingerprint: true, checksHead: "c21", conflictHead: "c21"}) {
 		t.Fatalf("effects %+v", got)
+	}
+}
+
+// roundMarks are the marks a review or address round leaves for the
+// planner on ref.
+func roundMarks(t *testing.T, te *testEnv, ref pr.Ref) map[string]string {
+	t.Helper()
+	st := te.loadRounds(t)
+	out := map[string]string{}
+	for _, name := range []string{ghplan.MarkReviewed, ghsource.MarkAddressedReviews, ghsource.MarkAddressedChecks, ghsource.MarkAddressedConflict} {
+		if v := st.Mark(ref.String(), name); v != "" {
+			out[name] = v
+		}
+	}
+	return out
+}
+
+func TestASentRoundLeavesThePlannerTheMarksItsPlanNamed(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, intent, stage, round string
+		scenario                   func(*testing.T) sweepCase
+	}{
+		{"sweep follow-up", string(dintent.Review), roundFollowup, roundFollowup, followupScenario},
+		{"sweep address", string(dintent.Address), "", roundAddress, addressScenario},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sc := c.scenario(t)
+			r := newStartRig(t, sc, c.intent, c.stage)
+			planned, ok := r.planner().round(sc.ref.String(), c.round)
+			if !ok {
+				t.Fatalf("no %s planned", c.round)
+			}
+			if _, err := r.run(t, automation.RunOpts{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := roundMarks(t, sc.te, sc.ref); !maps.Equal(got, planned.OnSent) {
+				t.Fatalf("marks %v, want exactly the plan's %v", got, planned.OnSent)
+			}
+			if _, due := offeredRounds(t, sc).round(sc.ref.String(), c.round); due {
+				t.Fatalf("the %s is planned again after it was sent", c.round)
+			}
+		})
+	}
+}
+
+func TestAHeldRoundRunNowLeavesThePlannerTheReviewsItCovered(t *testing.T) {
+	t.Parallel()
+	sc := followupScenario(t)
+	exhaustCap(t, sc)
+	sc.te.gh.basics = openBasics
+	planned, ok := plannedRounds(t, sc).round(sc.ref.String(), roundFollowup)
+	if !ok {
+		t.Fatal("no follow-up planned")
+	}
+	if err := (envActions{sc.env, nil}).Run(context.Background(), sc.ref.Unit(), daemon.Call{Out: io.Discard}); err != nil {
+		t.Fatalf("%v\n%s", err, sc.te.err)
+	}
+	if got := roundMarks(t, sc.te, sc.ref); !maps.Equal(got, planned.OnSent) {
+		t.Fatalf("marks %v, want the reviews the held follow-up covered %v", got, planned.OnSent)
+	}
+	if _, due := offeredRounds(t, sc).round(sc.ref.String(), roundFollowup); due {
+		t.Fatal("the follow-up is planned again after run now sent it")
 	}
 }

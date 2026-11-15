@@ -170,7 +170,7 @@ func serve(ctx context.Context, e *Env, args []string) error {
 			deps := endpoint.wire(serveDeps(gctx, e, db, cfg, logf, loopMu, appState), cfg)
 			deps.ConfigWarning = e.cfg.Warning
 			deps.EffectWarnings = e.effectProblems.list
-			srv := daemon.New(deps)
+			srv := e.newDaemon(deps)
 			e.Briefing, e.consequences = srv, srv
 			e.linkStates.Store(srv)
 			if e.jobRunner != nil {
@@ -297,6 +297,8 @@ func serveAllDeps(ctx context.Context, e *Env, db *sqlite.DB, cfg config.Config,
 	host := e.moduleHost(db)
 	store.UseHost(host(forge))
 	sessions := e.serveTurns(ctx, db, store, cfg, logf)
+	starts := e.servedStarts(loopMu, logf)
+	starter := starts.starter
 	var queue *brief.Queue
 	var briefs *interruptFirst
 	var intakeBriefs intake.Briefs
@@ -368,7 +370,7 @@ func serveAllDeps(ctx context.Context, e *Env, db *sqlite.DB, cfg config.Config,
 
 		NotifierStart: notifierStart(),
 
-		TurnByHand: e.byHand(loopMu),
+		TurnByHand: e.byHand(),
 		Startup:    e.startupOnce(cfg, logf),
 		Homes:      e.liveHomes(cfg),
 		DryRunTurn: e.dryRunTurn,
@@ -407,7 +409,7 @@ func serveAllDeps(ctx context.Context, e *Env, db *sqlite.DB, cfg config.Config,
 	e.callBudget = callBudget(db, cfg, e.Now)
 	e.serveDossierTurns(ctx, dossierSvc, db, cfg, logf)
 	e.servePayloads(mods)
-	d = e.serveHeadless(ctx, d, db, cfg, mods, logf)
+	d = e.serveHeadless(ctx, d, db, cfg, starter, logf)
 	d.Placer = sessionPlacer{e: e, cfg: cfg}
 	d.UnitEnded = unitsEnded(mods)
 	e.viewFacts().set(authorFacts(mods))
@@ -426,7 +428,9 @@ func serveAllDeps(ctx context.Context, e *Env, db *sqlite.DB, cfg config.Config,
 	if briefs != nil && briefsItself(mods) {
 		e.startBriefs(ctx, queue, logf)
 	}
-	return withEngine(d, e, ed)
+	d = withEngine(d, e, ed)
+	starts.plan.set(d.Plan)
+	return d
 }
 
 // briefsItself says a module's units are briefed by the queue's own calls,
@@ -1132,7 +1136,7 @@ func serveUntilConfigLoads(ctx context.Context, e *Env, db *sqlite.DB, logf func
 			}
 		}
 	})
-	return daemon.New(deps).Run(dctx)
+	return e.newDaemon(deps).Run(dctx)
 }
 
 // briefQueue is the brief queue and, when the agent cannot brief, why: the

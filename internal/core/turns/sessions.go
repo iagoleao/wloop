@@ -172,19 +172,25 @@ type Launch struct {
 	Answer   string
 	Guidance string
 	Inputs   map[string]any
-	// Trigger is a new turn's; a resume inherits the trigger of the turn it
-	// resumes and ignores this.
+	// Trigger is the new turn's, also when it resumes an earlier turn's
+	// session.
 	Trigger turn.Trigger
 	// WorkspaceID, Home and Model are set by the probe: run in this
 	// workspace, with this agent home and model, instead of the intent's rules.
 	WorkspaceID, Home, Model string
 	// Why is the workflow that started the turn; nil for a turn started by hand.
 	Why *workflow.Why
+	// ByPerson is a new turn a person asked for, whatever its Trigger.
+	ByPerson bool
+	// Turn is the turn the Launcher records, as Start or Resume admitted
+	// it; its Unit, Intent, Guidance, Inputs, Trigger and ResumeOf are the
+	// launch's.
+	Turn Turn
 }
 
 // Launcher runs a turn the core asks for (a resume or a Continue) through the
 // round code: it ensures the workspace, picks or starts a turn-capable
 // session, renders and sends the turn through Service.Send.
 type Launcher interface {
-	Launch(ctx context.Context, l Launch) error
+	Launch(ctx context.Context, l Launch) (Outcome, error)
 }

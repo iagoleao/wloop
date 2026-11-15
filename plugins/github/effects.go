@@ -27,7 +27,9 @@ const deliveryReview = "review"
 // applyTurnEffect applies a turn effect of the plugin's rounds: pr.reviewed
 // marks the reviews a launched review round covered once its agent took
 // it, pr.addressed the reviews so far and the head's checks and conflict an
-// address round covered, and pr.nudged records whom a nudge turn asked.
+// address round covered, and pr.nudged records whom a nudge turn asked. A
+// round the plan named is marked by the plan's OnSent, which the host
+// writes, so neither mark is written for it.
 func (p *Plugin) applyTurnEffect(ctx context.Context, req src.EffectRequest) error {
 	r, err := p.running()
 	if err != nil {
@@ -39,11 +41,17 @@ func (p *Plugin) applyTurnEffect(ctx context.Context, req src.EffectRequest) err
 	}
 	var marks map[string]string
 	switch req.Effect {
+	case EffectReviewed, EffectAddressed:
+		if req.Planned {
+			return nil
+		}
+	}
+	switch req.Effect {
 	case EffectReviewed:
 		if req.Route != src.RouteLaunch || !req.Taken {
 			return nil
 		}
-		if marks, err = r.reviewedMarks(ctx, ref); err != nil {
+		if marks, err = r.reviewedMarks(ctx, ref, req.Turn); err != nil {
 			return err
 		}
 	case EffectAddressed:
@@ -63,11 +71,12 @@ func (p *Plugin) applyTurnEffect(ctx context.Context, req src.EffectRequest) err
 	return r.host.Recorder.SetMarks(ctx, req.Unit, marks)
 }
 
-// reviewedMarks cover the reviews of the stored pull request a review round
-// saw; none while the store has not read it in full.
-func (r *running) reviewedMarks(ctx context.Context, ref pr.Ref) (map[string]string, error) {
+// reviewedMarks cover the reviews of the stored pull request review round t
+// saw; none while the store has not read it in full, or once a push moved
+// its head off the one t read, whose reviews a follow-up still covers.
+func (r *running) reviewedMarks(ctx context.Context, ref pr.Ref, t *src.TurnRef) (map[string]string, error) {
 	row, ok, err := r.db.PR(ctx, ref)
-	if err != nil || !ok {
+	if err != nil || !ok || t == nil || row.HeadOid != t.Head {
 		return nil, err
 	}
 	details, err := r.db.Details(ctx, []pr.Ref{ref})

@@ -41,6 +41,7 @@ import (
 	"github.com/wloophq/wloop/internal/domain/wake"
 	"github.com/wloophq/wloop/internal/github"
 	"github.com/wloophq/wloop/internal/meter"
+	src "github.com/wloophq/wloop/pkg/plugin/source"
 )
 
 type fakeActions struct {
@@ -59,6 +60,27 @@ type fakeActions struct {
 	bound []string
 	// store, when set, is marked by an adopt as the real take-over does.
 	store *inventory.Store
+	// start, when set, starts each intent's turn as the command line's
+	// actions do: its guidance cut and its prepare run.
+	start *turns.Starter
+}
+
+// startingActions are actions whose intents start through a turn start
+// whose prepare is s's, as serve wires them.
+func startingActions(s *Server) *fakeActions {
+	return &fakeActions{start: turnstest.Starter(turnstest.Defs{Registry: s.loaded().Registry}, nil, s)}
+}
+
+// startedCall is a fake intent call run as the start's runner.
+type startedCall struct {
+	c    Call
+	call func(c Call) error
+}
+
+func (x startedCall) Run(_ context.Context, t turns.Turn) (turns.Outcome, error) {
+	c := x.c
+	c.Guidance, c.Inputs = t.Guidance(), t.Inputs()
+	return turns.Outcome{ID: "t1", Submitted: true}, x.call(c)
 }
 
 func (f *fakeActions) record(ctx context.Context, call string, c Call) error {
@@ -86,6 +108,14 @@ func (f *fakeActions) Adopt(ctx context.Context, u unit.Unit, c Call) error {
 	return inventorytest.Of(f.store).SetAdopted(ctx, r)
 }
 func (f *fakeActions) Intent(ctx context.Context, name string, u unit.Unit, c Call) error {
+	if f.start != nil {
+		start := f.start
+		f.start = nil
+		defer func() { f.start = start }()
+		_, err := start.Start(ctx, turns.Request{Unit: u, Intent: turn.Intent(name), Guidance: c.Guidance, Inputs: c.Inputs, Trigger: turn.ByHand, ByPerson: true},
+			startedCall{c: c, call: func(c Call) error { return f.Intent(ctx, name, u, c) }})
+		return err
+	}
 	r := refOf(u)
 	f.inputs = append(f.inputs, c.Inputs)
 	f.bound = append(f.bound, strings.Join(c.Items, ",")+"@"+c.Task)
@@ -248,16 +278,6 @@ func TestDelegatedActions(t *testing.T) {
 	if !slices.Equal(fa.calls, []string{"review acme/api#7 look at the migration", "open acme/api#7", "run acme/api#7"}) {
 		t.Fatalf("%v", fa.calls)
 	}
-	evs, _ := s.store().Events(context.Background(), r7)
-	sent := 0
-	for _, e := range evs {
-		if e.Kind == dinv.KindRoundSent {
-			sent++
-		}
-	}
-	if sent != 2 {
-		t.Fatalf("round_sent events: %d", sent)
-	}
 }
 
 func TestAStartBlockOnAnUntrustedFolderOffersTrustAndDismiss(t *testing.T) {
@@ -265,7 +285,7 @@ func TestAStartBlockOnAnUntrustedFolderOffersTrustAndDismiss(t *testing.T) {
 	for _, c := range []struct {
 		action, call, kind, data string
 	}{
-		{"trust_run", "trust_run acme/api#7", dinv.KindRoundSent, "trusted its folder and ran"},
+		{"trust_run", "trust_run acme/api#7", "", ""},
 		{"unblock", "unblock acme/api#7", dinv.KindRoundUnblocked, "dismissed by you"},
 	} {
 		t.Run(c.action, func(t *testing.T) {
@@ -295,7 +315,7 @@ func TestAStartBlockOnAnUntrustedFolderOffersTrustAndDismiss(t *testing.T) {
 				t.Fatalf("%v", fa.calls)
 			}
 			evs, _ := s.store().Events(context.Background(), r7)
-			if last := evs[len(evs)-1]; last.Kind != c.kind || last.Data != c.data {
+			if last := evs[len(evs)-1]; c.kind != "" && (last.Kind != c.kind || last.Data != c.data) {
 				t.Fatalf("last event %+v", last)
 			}
 		})
@@ -393,6 +413,27 @@ func TestDelegateErrorIs500AndRecordsNothing(t *testing.T) {
 	}
 }
 
+func TestADelegatedActionWhosePluginIsOutOfReachIs503(t *testing.T) {
+	t.Parallel()
+	s := newServer(t)
+	s.store().AppendEvents(context.Background(), []dinv.Event{{PR: r7, Kind: dinv.KindRoundHeld, At: s.deps.Now().Add(time.Second), Data: "daily cap"}})
+	for _, cause := range []error{
+		fmt.Errorf("%w: acme/api#7: no running plugin applies pr.reviewed", src.ErrUnavailable),
+		fmt.Errorf("%w: no preparer yet", turns.ErrTransient),
+	} {
+		fa := &fakeActions{err: cause}
+		s.deps.Actions = fa
+		for _, action := range []string{"review", "run_now"} {
+			if rec := post(t, s, "/api/units/github/acme%2Fapi%237/"+action, `{"source":"cockpit"}`); rec.Code != 503 || !strings.Contains(rec.Body.String(), strings.SplitN(cause.Error(), ": ", 2)[1]) {
+				t.Fatalf("%s, %v: %d %s", action, cause, rec.Code, rec.Body)
+			}
+		}
+		if len(fa.calls) != 2 {
+			t.Fatalf("calls %v, want both actions delegated", fa.calls)
+		}
+	}
+}
+
 func TestTakeOverRecordsItsEvent(t *testing.T) {
 	t.Parallel()
 	s := newServer(t)
@@ -429,7 +470,7 @@ func TestActionOutlivesTheRequest(t *testing.T) {
 			done <- rec.Code
 		}()
 		synctest.Wait()
-		if countEvents(t, s, dinv.KindRoundSent) != 0 {
+		if len(fa.calls) != 0 {
 			t.Fatal("the action ran while the loop mutex was held")
 		}
 		cancel()
@@ -437,7 +478,7 @@ func TestActionOutlivesTheRequest(t *testing.T) {
 		if code := <-done; code != 200 {
 			t.Fatalf("%d", code)
 		}
-		if countEvents(t, s, dinv.KindRoundSent) != 1 || len(fa.calls) != 1 {
+		if len(fa.calls) != 1 {
 			t.Fatalf("calls %v", fa.calls)
 		}
 	})
@@ -599,7 +640,7 @@ func TestNudgeAsksWhoItWaitsOn(t *testing.T) {
 	t.Parallel()
 	s := newServer(t)
 	seedWaitingOnAna(t, s)
-	fa := &fakeActions{}
+	fa := startingActions(s)
 	s.deps.Actions = fa
 	if rec := post(t, s, "/api/units/github/acme%2Fapi%239/nudge", `{"guidance":"be brief"}`); rec.Code != 200 {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
@@ -634,7 +675,7 @@ func TestNudgeAsksTheMaintainersOfMyPullRequestWithNoReviewer(t *testing.T) {
 	if err := inventorytest.Of(s.store()).UpsertPR(ctx, pr); err != nil {
 		t.Fatal(err)
 	}
-	fa := &fakeActions{}
+	fa := startingActions(s)
 	s.deps.Actions = fa
 	if rec := post(t, s, "/api/units/github/acme%2Fapi%239/nudge", `{}`); rec.Code != 200 {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
@@ -737,7 +778,7 @@ func TestGuidanceIsCutAtItsMax(t *testing.T) {
 	t.Parallel()
 	s := newServer(t)
 	seedWaitingOnAna(t, s)
-	fa := &fakeActions{}
+	fa := startingActions(s)
 	s.deps.Actions = fa
 	nudge, _ := s.loaded().Registry.Get("nudge")
 	if nudge.Guidance.Max == 0 {
@@ -983,6 +1024,7 @@ func TestANudgeThatTracksAsksWhomTheFreshReadNames(t *testing.T) {
 	t.Parallel()
 	fa := &fakeActions{}
 	s := newServerWith(t, func(d *Deps) { d.Actions = fa })
+	fa.start = startingActions(s).start
 	ctx := context.Background()
 	web := github.Ref{Owner: "acme", Repo: "web", Number: 3}
 	old := s.deps.Now().Add(-72 * time.Hour)
@@ -1088,11 +1130,12 @@ type fakeLauncher struct {
 	mu       sync.Mutex
 	loopMu   *lock.Mutex
 	launches []turns.Launch
-	// loopHeld records, per launch, whether the loop mutex was held.
+	// loopHeld records, per launch, whether the loop mutex was held and its
+	// context marked so.
 	loopHeld []bool
 }
 
-func (l *fakeLauncher) Launch(_ context.Context, x turns.Launch) error {
+func (l *fakeLauncher) Launch(ctx context.Context, x turns.Launch) (turns.Outcome, error) {
 	held := !l.loopMu.TryLock()
 	if !held {
 		l.loopMu.Unlock()
@@ -1100,8 +1143,8 @@ func (l *fakeLauncher) Launch(_ context.Context, x turns.Launch) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.launches = append(l.launches, x)
-	l.loopHeld = append(l.loopHeld, held)
-	return nil
+	l.loopHeld = append(l.loopHeld, held && lock.Held(ctx))
+	return turns.Outcome{Submitted: true}, nil
 }
 
 type turnRig struct {
@@ -1270,6 +1313,34 @@ func TestTheFastJobDeliversAQueuedAnswerOnceTheAgentIsIdle(t *testing.T) {
 	}
 }
 
+func TestAQueuedAnswerIsDeliveredUnderTheHeldLoop(t *testing.T) {
+	t.Parallel()
+	for name, deliver := range map[string]func(r *turnRig){
+		"by the fast job": func(r *turnRig) { r.s.reconcileTurns(context.Background()) },
+		"after its stop": func(r *turnRig) {
+			if err := r.s.deliverStopped(context.Background(), "term-1"); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		r := newTurnRig(t)
+		r.busyAsked(&record.Question{Kind: "confirm", Text: "Publish?"})
+		if rec := post(t, r.s, "/api/units/github/acme%2Fapi%238/answer", `{"guidance":"publish it"}`); rec.Code != 200 {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+		r.sessions.SetAgents(turns.AgentObservation{WorkspaceID: "ws-1", Pane: "tab-1:leaf-1", TerminalKey: "tab-1", State: turn.AgentDone})
+		var held []bool
+		r.sessions.OnType = func(ctx context.Context, _, _ string) (bool, error) {
+			held = append(held, lock.Held(ctx))
+			return true, nil
+		}
+		deliver(r)
+		if !slices.Equal(held, []bool{true}) {
+			t.Errorf("%s: typed with the loop held %v, want once with it marked", name, held)
+		}
+	}
+}
+
 func TestAnswerWithoutATurnIsRefused(t *testing.T) {
 	t.Parallel()
 	r := newTurnRig(t)
@@ -1324,6 +1395,28 @@ func TestTurnActionsNeedNoInventoryRow(t *testing.T) {
 	}
 	if len(r.launcher.launches) != 1 || r.launcher.launches[0].Unit != probe.Unit() || r.launcher.launches[0].Intent != turn.Intent(dintent.Probe) {
 		t.Fatalf("launches %+v", r.launcher.launches)
+	}
+}
+
+func TestAQuestionNoGateHoldsIsActedOnUnderTheHeldLoop(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		state      turn.State
+		path, body string
+		question   *record.Question
+	}{
+		"an answer":  {turn.Asked, "answer", `{"guidance":"publish it"}`, &record.Question{Kind: "free", Text: "Publish?"}},
+		"a continue": {turn.Failed, "continue", `{}`, nil},
+	} {
+		r := newTurnRig(t)
+		r.s.deps.Gates = nil
+		r.asked(pr.Ref{Owner: "acme", Repo: "api", Number: 8}, turn.Intent(dintent.Address), c.state, c.question)
+		if rec := post(t, r.s, "/api/units/github/acme%2Fapi%238/"+c.path, c.body); rec.Code != 200 {
+			t.Fatalf("%s: %d %s", name, rec.Code, rec.Body)
+		}
+		if !slices.Equal(r.launcher.loopHeld, []bool{true}) {
+			t.Errorf("%s: launched with the loop held and marked %v, want once", name, r.launcher.loopHeld)
+		}
 	}
 }
 

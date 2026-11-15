@@ -16,6 +16,9 @@ import (
 	dusage "github.com/wloophq/wloop/internal/domain/usage"
 )
 
+// HeadlessStart is what a headless runner rendered of a turn. Its Unit,
+// Intent, Trigger, Guidance, Inputs and ResumeOf are the admitted Turn's:
+// BeginHeadless records those of the Turn it is given.
 type HeadlessStart struct {
 	Unit     unit.Unit
 	Intent   turn.Intent
@@ -24,9 +27,10 @@ type HeadlessStart struct {
 	Guidance string
 	Workflow string
 	// Role is the role the turn's intent holds, "" none.
-	Role  string
-	Items []string
-	Task  string
+	Role   string
+	Items  []string
+	Task   string
+	Inputs map[string]any
 	// ResumeOf is the headless turn whose question this run answers, 0 none.
 	ResumeOf int64
 }
@@ -91,6 +95,28 @@ func TaskOf(t turn.Turn) string {
 	return s
 }
 
+// InputsOf are the turn's inputs without the items and task kept among them.
+func InputsOf(t turn.Turn) map[string]any {
+	out := maps.Clone(t.Inputs)
+	delete(out, itemsInput)
+	delete(out, taskInput)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// headlessInputs are h's inputs with its items, even none, and task kept
+// among them.
+func headlessInputs(h HeadlessStart) map[string]any {
+	in := maps.Clone(h.Inputs)
+	if in == nil {
+		in = map[string]any{}
+	}
+	in[itemsInput] = append([]string{}, h.Items...)
+	return bound(in, nil, h.Task)
+}
+
 // bound is inputs with items and task kept under their reserved names.
 func bound(inputs map[string]any, items []string, task string) map[string]any {
 	if len(items) == 0 && task == "" {
@@ -109,9 +135,13 @@ func bound(inputs map[string]any, items []string, task string) map[string]any {
 	return out
 }
 
-// BeginHeadless stores a turn sent and started with Mode headless and no handle, with Items in the
+// BeginHeadless stores t, a turn sent and started with Mode headless and no handle, with Items in the
 // turn's Inputs under "items"; ErrHeadlessBusy when the unit already has a headless turn started.
-func (s *Service) BeginHeadless(ctx context.Context, h HeadlessStart) (int64, error) {
+func (s *Service) BeginHeadless(ctx context.Context, t Turn, h HeadlessStart) (int64, error) {
+	if err := t.Use(); err != nil {
+		return 0, err
+	}
+	h.Unit, h.Intent, h.Trigger, h.Guidance, h.Inputs, h.ResumeOf = t.unit, t.intent, t.trigger, t.guidance, t.inputs, t.resumeOf
 	if h.Turn == "" {
 		return 0, errors.New("a turn needs an id")
 	}
@@ -127,7 +157,7 @@ func (s *Service) BeginHeadless(ctx context.Context, h HeadlessStart) (int64, er
 	}
 	now := s.now()
 	b.Send(turn.Turn{Intent: h.Intent, ID: h.Turn, Trigger: h.Trigger, Guidance: h.Guidance, ResumeOf: h.ResumeOf,
-		Inputs: bound(map[string]any{itemsInput: append([]string{}, h.Items...)}, nil, h.Task), SentAt: now, Runner: turn.RunnerHeadless, Workflow: h.Workflow, Role: h.Role})
+		Inputs: headlessInputs(h), SentAt: now, Runner: turn.RunnerHeadless, Workflow: h.Workflow, Role: h.Role})
 	if _, err := b.Start(h.Turn, "", now); err != nil {
 		s.mu.Unlock()
 		return 0, err
@@ -141,15 +171,15 @@ func (s *Service) BeginHeadless(ctx context.Context, h HeadlessStart) (int64, er
 		s.mu.Unlock()
 		return 0, err
 	}
-	t, _ := saved.ByID(h.Turn)
+	begun, _ := saved.ByID(h.Turn)
 	if s.begun == nil {
 		s.begun = map[int64]unit.Unit{}
 	}
-	s.begun[t.Seq] = h.Unit
+	s.begun[begun.Seq] = h.Unit
 	s.mu.Unlock()
 	s.publish(evs...)
 	s.changed(ctx, h.Unit)
-	return t.Seq, nil
+	return begun.Seq, nil
 }
 
 // EndHeadless stores the record (failed with Err as its summary when set, or with the problems of a record
