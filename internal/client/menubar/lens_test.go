@@ -48,7 +48,7 @@ func TestMenubarSectionsComeFromTheProfile(t *testing.T) {
 		t.Fatalf("menu %q", got)
 	}
 	it.Action()
-	waitFor(t, func() bool { return slices.Equal(r.openedURLs(), []string{"cockpit#view=mine"}) })
+	waitFor(t, func() bool { return slices.Equal(r.openedURLs(), []string{"cockpit#view=home"}) })
 
 	r.d.mu.Lock()
 	r.d.loading = []api.Loading{{Plugin: "acme", Reason: "importing the threads"}}

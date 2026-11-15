@@ -64,3 +64,24 @@ func TestNotificationOpenFocusesTheWindow(t *testing.T) {
 		t.Fatalf("the browser opened %q", o)
 	}
 }
+
+func TestOpenCockpitShowsTheHomeInTheWindow(t *testing.T) {
+	r := &rig{d: newDaemon(), tray: &fakeTray{}, notes: &fakeNotifier{perm: PermissionAuthorized}}
+	var mu sync.Mutex
+	var shown []string
+	r.c = New(Config{
+		Daemon: r.d, Tray: r.tray, Notifier: r.notes,
+		OpenURL:    func(u string) error { r.mu.Lock(); r.opened = append(r.opened, u); r.mu.Unlock(); return nil },
+		CockpitURL: func(route string) (string, error) { return "cockpit#" + route, nil },
+		Window:     func(route string) error { mu.Lock(); shown = append(shown, route); mu.Unlock(); return nil },
+		Quit:       func() {},
+		Now:        func() time.Time { return now },
+	})
+	r.c.Refresh(context.Background())
+	it, ok := find(r.tray.menu, "Open cockpit")
+	if !ok {
+		t.Fatalf("menu %q", titles(r.tray.menu))
+	}
+	it.Action()
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return slices.Equal(shown, []string{window.HomeRoute}) })
+}

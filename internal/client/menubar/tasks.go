@@ -95,14 +95,6 @@ func (c *Controller) loadingItems() []MenuItem {
 
 func (c *Controller) viewTasks(v string) []api.TaskView { return c.tasks[v] }
 
-// firstView is the route of the first view the menu lists; the cockpit's own first view when it lists none.
-func (c *Controller) firstView() string {
-	if len(c.taskViews) == 0 {
-		return ""
-	}
-	return viewRoute(c.taskViews[0].ID)
-}
-
 func (c *Controller) title() string {
 	params := map[string]any{}
 	badge := 0

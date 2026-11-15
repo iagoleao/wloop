@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/wloophq/wloop/internal/api"
+	"github.com/wloophq/wloop/internal/client/window"
 	"github.com/wloophq/wloop/internal/domain/record"
 	"github.com/wloophq/wloop/internal/domain/unit"
 )
@@ -174,13 +175,13 @@ func (c *Controller) Respond(ctx context.Context, r Response) {
 }
 
 // routeOf is the cockpit route a notification opens: a note's task part is
-// its route, the digest the menu's first view, anything else its task.
+// its route, anything else but the digest its task.
 func (c *Controller) routeOf(cat Category, tk string) string {
 	switch cat {
 	case api.CategoryNote:
 		return tk
 	case api.CategoryDigest:
-		return c.firstView()
+		return window.HomeRoute
 	}
 	return taskRoute(tk)
 }
@@ -340,9 +341,9 @@ func (c *Controller) notifyNote(id, task, title, body string) {
 	})
 }
 
-// postNotice posts what a workflow's notify.self raised; it opens its unit.
+// postNotice posts what a workflow's notify.self raised.
 func (c *Controller) postNotice(n api.Notice) {
-	route := c.firstView()
+	route := window.HomeRoute
 	if !n.Unit.IsZero() {
 		route = unitRoute(n.Unit)
 	}

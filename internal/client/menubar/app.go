@@ -481,7 +481,7 @@ func (c *Controller) menu(h api.Health) []MenuItem {
 		items = append(items, MenuItem{Separator: true})
 	}
 	items = append(items,
-		MenuItem{Title: w.T("Open cockpit", nil), Enabled: true, Action: c.later(func(ctx context.Context) error { return c.open(c.firstView()) })},
+		MenuItem{Title: w.T("Open cockpit", nil), Enabled: true, Action: c.later(func(ctx context.Context) error { return c.open(window.HomeRoute) })},
 		MenuItem{Title: w.T("Sweep now", nil), Enabled: true, Action: c.later(func(ctx context.Context) error { return c.cfg.Daemon.Trigger(ctx, "sweep") })},
 	)
 	pause := MenuItem{Title: w.T("Pause automatic rounds", nil), Enabled: true, Action: c.later(func(ctx context.Context) error { return c.cfg.Daemon.SetPause(ctx, api.PauseRequest{Paused: true}) })}

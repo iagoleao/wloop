@@ -16,6 +16,9 @@ import (
 // PanelRoute is the cockpit route the panel loads.
 const PanelRoute = "panel=omnibox"
 
+// HomeRoute is the cockpit's home. An empty route would keep a shown window where it is.
+const HomeRoute = "view=home"
+
 // reconnectAfter is the wait before subscribing again to a daemon that went
 // away, the same as the app's wait for the daemon to start.
 const reconnectAfter = 200 * time.Millisecond

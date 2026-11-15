@@ -895,3 +895,13 @@ func TestNotificationActionsUseTaskIds(t *testing.T) {
 		t.Fatalf("the note's id %q does not carry the task route", note.ID)
 	}
 }
+
+func TestANoticeWithoutAUnitOpensTheHome(t *testing.T) {
+	r := newRig(t)
+	r.c.postNotice(api.Notice{ID: "ping@1", Workflow: "ping", Text: "look"})
+	n := r.notes.snapshot()[0]
+	r.c.Respond(context.Background(), Response{ID: n.ID, Action: ActionOpen})
+	if o := r.openedURLs(); !slices.Equal(o, []string{"cockpit#view=home"}) {
+		t.Fatalf("opened %v", o)
+	}
+}
